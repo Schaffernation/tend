@@ -3,8 +3,9 @@
 // status, and starts, stops, restarts, and opens them. All the work happens in `tend`; this app only
 // calls it.
 //
-// Source: ~/src/tend/app/Tend.swift
-// Build and install with app/build.sh.
+// Source: https://github.com/Schaffernation/tend
+// Build and install with app/build.sh. The build copies bin/tend into the
+// app's Resources folder, and the app runs that copy.
 
 import ServiceManagement
 import SwiftUI
@@ -32,6 +33,15 @@ struct AppProfile: Decodable, Identifiable, Hashable {
     var rules: String { ((match?.names ?? []) + (match?.paths ?? [])).joined(separator: ", ") }
 }
 
+/// How `tend open` opens a session: the terminal app and the attach command.
+struct TerminalSettings: Decodable, Hashable {
+    let app: String
+    let attach: String
+    let mode: String
+    let apps: [String]
+    let presets: [String: String]
+}
+
 struct Service: Decodable, Identifiable, Hashable {
     let name: String
     let dir: String
@@ -50,6 +60,7 @@ final class Model: ObservableObject {
     @Published var services: [Service] = []
     @Published var error: String?
     @Published var apps: [AppProfile] = []
+    @Published var terminal: TerminalSettings?
     @Published var busy = false
     /// The new-session form. Kept here, not in the view, so it survives the
     /// panel closing while a folder picker is open.
@@ -64,12 +75,43 @@ final class Model: ObservableObject {
     }
     @AppStorage("restoreOnLaunch") var restoreOnLaunch = true
 
-    nonisolated static let tend = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".local/bin/tend").path
+    nonisolated static let tend = Bundle.main.url(forResource: "tend", withExtension: nil)?.path
+        ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/tend").path
+
+    /// Where "Install command-line tool" links `tend`.
+    nonisolated static let cliLink = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".local/bin/tend")
+
+    nonisolated static let path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+    /// Why tend can't run on this Mac, or nil if it can. tend is a Python
+    /// script, and macOS only ships Python with the developer tools.
+    static let setupProblem: String? = {
+        let fm = FileManager.default
+        if ["/opt/homebrew/bin/python3", "/usr/local/bin/python3"].contains(where: fm.isExecutableFile) {
+            return nil
+        }
+        // /usr/bin/python3 is a stub until the developer tools are installed.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        p.arguments = ["-p"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        if (try? p.run()) != nil {
+            p.waitUntilExit()
+            if p.terminationStatus == 0 { return nil }
+        }
+        return "Tend needs Python 3. Install the Command Line Tools with xcode-select --install, or install Python with Homebrew: brew install python"
+    }()
 
     init() {
+        if let problem = Model.setupProblem {
+            error = problem
+            return
+        }
         Task {
             if restoreOnLaunch { await run(["restore"]) }
+            await loadTerminal()
             while true {
                 await refresh()
                 try? await Task.sleep(for: .seconds(5))
@@ -87,7 +129,7 @@ final class Model: ObservableObject {
             p.executableURL = URL(fileURLWithPath: Model.tend)
             p.arguments = args
             var env = ProcessInfo.processInfo.environment
-            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+            env["PATH"] = Model.path
             p.environment = env
             let out = Pipe(), err = Pipe()
             p.standardOutput = out
@@ -116,6 +158,38 @@ final class Model: ObservableObject {
             error = nil
         } catch {
             self.error = "Couldn't read tend's output: \(error.localizedDescription)"
+        }
+    }
+
+    func loadTerminal() async {
+        guard let data = await run(["terminal", "--json"]) else { return }
+        terminal = try? JSONDecoder().decode(TerminalSettings.self, from: data)
+    }
+
+    /// Change the terminal app or the attach command (a preset name or a command).
+    func setTerminal(app: String? = nil, attach: String? = nil) {
+        var args = ["terminal"]
+        if let app { args += ["--app", app] }
+        if let attach { args += ["--attach", attach] }
+        Task {
+            busy = true
+            error = nil
+            await run(args)
+            await loadTerminal()
+            busy = false
+        }
+    }
+
+    /// Link `tend` into ~/.local/bin, so you can run it in a terminal.
+    func installCLI() {
+        do {
+            let fm = FileManager.default
+            try fm.createDirectory(at: Model.cliLink.deletingLastPathComponent(),
+                                   withIntermediateDirectories: true)
+            try fm.createSymbolicLink(atPath: Model.cliLink.path, withDestinationPath: Model.tend)
+            error = nil
+        } catch {
+            self.error = "Couldn't link \(Model.cliLink.path): \(error.localizedDescription)"
         }
     }
 
@@ -227,6 +301,7 @@ struct ContentView: View {
             }
 
             AppsSection()
+            TerminalSection()
 
             Toggle("Restore when Tend opens", isOn: model.$restoreOnLaunch)
                 .help("When Tend opens, start every tracked session that's set to restore.")
@@ -241,6 +316,13 @@ struct ContentView: View {
                         openAtLogin = SMAppService.mainApp.status == .enabled
                     }
                 }
+
+            if Model.setupProblem == nil
+                && (try? FileManager.default.destinationOfSymbolicLink(atPath: Model.cliLink.path)) == nil
+                && !FileManager.default.fileExists(atPath: Model.cliLink.path) {
+                Button("Install command-line tool") { model.installCLI() }
+                    .help("Link tend into ~/.local/bin, so you can run it in a terminal and over ssh. Add ~/.local/bin to your PATH if it isn't there already.")
+            }
 
             HStack {
                 Button("Edit config") {
@@ -516,5 +598,74 @@ struct AppsSection: View {
         // For a .app bundle, use its main executable.
         if url.pathExtension == "app", let exe = Bundle(url: url)?.executableURL { url = exe }
         model.act(["apps", "add", url.path])
+    }
+}
+
+/// How the open button opens a session: which terminal app, and which
+/// command it runs there. Use tmux control mode for iTerm2's tmux integration.
+struct TerminalSection: View {
+    @EnvironmentObject var model: Model
+    @State private var expanded = false
+    @State private var custom = ""
+    @State private var editingCustom = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            if let t = model.terminal {
+                VStack(alignment: .leading, spacing: 6) {
+                    Picker("App", selection: Binding(
+                        get: { t.app },
+                        set: { model.setTerminal(app: $0) }
+                    )) {
+                        ForEach(t.apps, id: \.self) { Text($0).tag($0) }
+                    }
+                    .help("The terminal app that the open button opens sessions in")
+
+                    Picker("Attach with", selection: Binding(
+                        get: { editingCustom ? "custom" : t.mode },
+                        set: { mode in
+                            if mode == "custom" {
+                                custom = t.attach
+                                editingCustom = true
+                            } else {
+                                editingCustom = false
+                                model.setTerminal(attach: mode)
+                            }
+                        }
+                    )) {
+                        Text("tmux attach").tag("tmux")
+                        Text("iTerm2 tmux integration (tmux -CC)").tag("control")
+                        Text("Custom command").tag("custom")
+                    }
+                    .help("tmux attach shows the session in one terminal window. tmux -CC uses control mode: iTerm2 shows each tmux window as a native window or tab.")
+
+                    if t.mode == "control" && t.app != "iTerm" {
+                        Text("tmux -CC needs iTerm2. Terminal shows control mode as raw text.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+
+                    if editingCustom || t.mode == "custom" {
+                        HStack {
+                            TextField("Command", text: $custom)
+                                .font(.system(.body, design: .monospaced))
+                                .onSubmit(saveCustom)
+                            Button("Save", action: saveCustom)
+                                .disabled(custom.trimmingCharacters(in: .whitespaces).isEmpty
+                                          || custom == t.attach)
+                        }
+                        .help("The command to run in the new window. {tmux} is the path to tmux, {target} is the session's tmux target, and {name} is the session name.")
+                    }
+                }
+                .padding(.top, 4)
+                .onAppear { if t.mode == "custom" { custom = t.attach } }
+            }
+        } label: {
+            Text("Terminal").help("How the open button opens a session in a terminal")
+        }
+    }
+
+    func saveCustom() {
+        editingCustom = false
+        model.setTerminal(attach: custom)
     }
 }

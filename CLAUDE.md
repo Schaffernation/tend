@@ -3,6 +3,8 @@
 Tend restores and manages long-running tmux sessions, with app-aware support
 for programs like Claude Code. `bin/tend` (Python, standard library only) holds
 all behavior; `app/Tend.swift` is a menu bar client that runs `tend ... --json`.
+Tend ships outside the Mac App Store, as a Developer ID signed, notarized disk
+image. It can't run in the App Sandbox, because it drives tmux and other apps.
 
 Before changing the design, or when you need to know why something is the way
 it is, read `docs/intent.md`. It holds the original intent, the decisions and
@@ -24,10 +26,15 @@ what's untested).
 
   Ask the user before you restart, stop, or restore any real session, or start a
   real `claude rc`.
-- After changing `app/`, run `app/build.sh`. It builds, installs to
+- After changing `app/` or `bin/tend`, run `app/build.sh`. It builds a
+  universal app, copies `bin/tend` into `Contents/Resources`, installs to
   `~/Applications/Tend.app`, and reopens the app. Build warnings count as
-  failures.
-- `~/.local/bin/tend` links to `bin/tend`. The app calls that path.
+  failures. Reopening the app runs `tend restore` if **Restore when Tend
+  opens** is on, so ask the user before you install.
+- The app runs its bundled copy of `tend`, not `~/.local/bin/tend`. On the user's
+  Mac, `~/.local/bin/tend` links to `bin/tend` for the terminal.
+- `app/release.sh` builds, signs, notarizes, and packages a disk image.
+  `app/make-icon.swift` draws the icon; rerun it after changing the design.
 - Use `.help` tooltips for hover text in the app.
 
 ## Gotchas

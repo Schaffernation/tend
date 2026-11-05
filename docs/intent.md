@@ -34,7 +34,7 @@ Two parts. All behavior lives in the CLI; the app is a thin client.
   library. It owns the config, tmux, process detection, and start, stop, and
   restore. It must keep working over ssh, with no GUI.
 - **`app/Tend.swift`** is a SwiftUI `MenuBarExtra` app, built with plain
-  `swiftc` (no Xcode project). It runs `~/.local/bin/tend ... --json` and
+  `swiftc` (no Xcode project). It runs its bundled copy of `tend ... --json` and
   renders the result. It polls `tend ls --json` and `tend apps --json` every
   5 seconds.
 

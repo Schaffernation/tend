@@ -3,19 +3,33 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key>
-  <string>com.example.tend</string>
+  <string>io.github.schaffernation.tend</string>
   <key>CFBundleName</key>
+  <string>Tend</string>
+  <key>CFBundleDisplayName</key>
   <string>Tend</string>
   <key>CFBundleExecutable</key>
   <string>Tend</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <!-- The version people see. release.sh names the disk image after it. -->
   <key>CFBundleShortVersionString</key>
   <string>0.1</string>
+  <!-- The build number. Raise it with every release. -->
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>© 2026 SchafferNation LLC</string>
   <!-- Menu bar only: no Dock icon and no main menu. -->
   <key>LSUIElement</key>
   <true/>

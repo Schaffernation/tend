@@ -35,11 +35,15 @@ Usage:
   tend apps rm ID                  Remove an app you added.
   tend attach NAME                 Attach to the session in this terminal.
   tend open NAME                   Open the session in a new terminal window.
+  tend terminal [--app APP] [--attach PRESET|COMMAND] [--json]
+                                   Show or change the terminal app and the
+                                   command `tend open` runs. The "control"
+                                   preset runs tmux -CC for iTerm2's tmux
+                                   integration.
 
 Config: ~/.config/tend/services.json (override with TEND_CONFIG).
 
-Source: ~/src/tend/bin/tend
-Linked to ~/.local/bin/tend.
+Source: https://github.com/Schaffernation/tend
 """
 
 import argparse
@@ -63,6 +67,13 @@ os.environ["PATH"] = (
 )
 CONFIG = Path(os.environ.get("TEND_CONFIG", HOME / ".config/tend/services.json"))
 SHELLS = {"zsh", "bash", "sh", "fish", "login"}
+TERMINALS = ["iTerm", "Terminal"]
+# Named attach commands for `tend terminal --attach`. "control" uses tmux
+# control mode, which iTerm2 turns into native windows and tabs.
+ATTACH_PRESETS = {
+    "tmux": "{tmux} attach -t {target}",
+    "control": "{tmux} -CC attach -t {target}",
+}
 
 
 class TendError(Exception):
@@ -76,10 +87,14 @@ def default_config():
     return {
         # Terminal app for `tend open`: "iTerm" or "Terminal".
         "terminal": "iTerm" if Path("/Applications/iTerm.app").exists() else "Terminal",
-        # Launch agent that owns the tmux server. If the server isn't running,
-        # tend kickstarts this agent before it starts a session. Set to null
-        # to let tend start the server itself.
-        "tmux_launch_agent": "com.example.tmux-server",
+        # Command that `tend open` runs in the new terminal window. {tmux} is
+        # the path to tmux, {target} is the quoted tmux target (=name), and
+        # {name} is the quoted session name. See ATTACH_PRESETS.
+        "attach_command": ATTACH_PRESETS["tmux"],
+        # Launch agent that owns the tmux server, like "com.example.tmux-server".
+        # If the server isn't running, tend kickstarts this agent before it
+        # starts a session. With null, tend lets tmux start the server itself.
+        "tmux_launch_agent": None,
         "services": [],
     }
 
@@ -123,6 +138,8 @@ def session_name(text):
 
 
 def tmux(*args, check=True):
+    if not shutil.which("tmux"):
+        raise TendError("tmux isn't installed. Install it with: brew install tmux")
     r = subprocess.run(["tmux", *args], capture_output=True, text=True)
     if check and r.returncode:
         raise TendError(r.stderr.strip() or f"tmux {args[0]} failed")
@@ -549,7 +566,12 @@ def stop(s_name):
 def open_in_terminal(cfg, name):
     if not has_session(name):
         raise TendError(f"'{name}' isn't running.")
-    attach = f"{shutil.which('tmux')} attach -t ={shlex.quote(name)}"
+    attach = (
+        cfg.get("attach_command", ATTACH_PRESETS["tmux"])
+        .replace("{tmux}", shlex.quote(shutil.which("tmux")))
+        .replace("{target}", shlex.quote(f"={name}"))
+        .replace("{name}", shlex.quote(name))
+    )
     if cfg.get("terminal", "").lower().startswith("iterm"):
         script = (
             'tell application "iTerm"\n'
@@ -567,6 +589,35 @@ def open_in_terminal(cfg, name):
     r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if r.returncode:
         raise TendError(r.stderr.strip())
+
+
+def terminal_settings(cfg):
+    attach = cfg.get("attach_command", ATTACH_PRESETS["tmux"])
+    mode = next((k for k, v in ATTACH_PRESETS.items() if v == attach), "custom")
+    return {
+        "app": cfg.get("terminal"),
+        "attach": attach,
+        "mode": mode,
+        "apps": TERMINALS,
+        "presets": ATTACH_PRESETS,
+    }
+
+
+def set_terminal(cfg, app=None, attach=None):
+    if app is not None:
+        match = next((t for t in TERMINALS if t.lower() == app.lower()), None)
+        if not match:
+            raise TendError(f"tend can open {' or '.join(TERMINALS)}, not '{app}'.")
+        cfg["terminal"] = match
+    if attach is not None:
+        attach = ATTACH_PRESETS.get(attach, attach).strip()
+        if "{target}" not in attach and "{name}" not in attach:
+            raise TendError(
+                "the attach command needs {target} or {name}, so it knows which session "
+                f"to attach to. Or use a preset: {', '.join(ATTACH_PRESETS)}."
+            )
+        cfg["attach_command"] = attach
+    save(cfg)
 
 
 def adopt(cfg, name, rows=None):
@@ -718,6 +769,14 @@ def main():
     sp.add_argument("--name")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("terminal", help="show or change how `tend open` opens a session")
+    sp.add_argument("--app", help=f"the terminal app: {' or '.join(TERMINALS)}")
+    sp.add_argument(
+        "--attach",
+        help=f"a preset ({', '.join(ATTACH_PRESETS)}) or a command with {{target}} or {{name}}",
+    )
+    sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("autostart")
     sp.add_argument("name")
     sp.add_argument("value", choices=["on", "off"])
@@ -835,6 +894,17 @@ def main():
 
     elif a.cmd == "open":
         open_in_terminal(cfg, a.name)
+
+    elif a.cmd == "terminal":
+        if a.app is not None or a.attach is not None:
+            set_terminal(cfg, a.app, a.attach)
+        t = terminal_settings(cfg)
+        if a.json:
+            json.dump(t, sys.stdout, indent=2)
+            print()
+        else:
+            print(f"App:    {t['app']}")
+            print(f"Attach: {t['attach']}" + (f"  ({t['mode']})" if t["mode"] != "custom" else ""))
 
 
 if __name__ == "__main__":
