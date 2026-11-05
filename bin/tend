@@ -50,6 +50,8 @@ Usage:
                                    preset runs tmux -CC for iTerm2's tmux
                                    integration.
 
+For a command's flags, run `tend COMMAND --help`.
+
 Config: ~/.config/tend/services.json (override with TEND_CONFIG).
 
 Source: https://github.com/Schaffernation/tend
@@ -980,6 +982,9 @@ def main():
     sp.add_argument("value", choices=["on", "off"])
 
     args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
     command = []
     if "--" in args:
         i = args.index("--")
