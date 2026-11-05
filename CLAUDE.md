@@ -56,5 +56,8 @@ what's untested).
   top-level code" for `Tend.swift`. It's a false alarm: `build.sh` compiles
   with `-parse-as-library`.
 - tmux session names can't contain `.` or `:`. `session_name()` replaces them.
+- The running app polls its bundled `tend ls`, which saves resume commands.
+  After you change how `bin/tend` computes them, rebuild the app, or its old
+  copy writes the old commands back within 5 seconds.
 - `tend ls` saves resume commands as a side effect. Use `status(cfg, sync=False)`
   when you need a read-only scan.
