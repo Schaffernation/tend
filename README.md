@@ -86,6 +86,16 @@ tend ls
 For all commands, run `tend --help`. Your sessions and apps are stored in
 `~/.config/tend/services.json`.
 
+## Claude Code skill
+
+`skills/tend` is a Claude Code skill for starting and managing sessions. Ask
+Claude for a new session, and it lists your project folders, can create a new
+one, and starts the session with `tend new`. To install it:
+
+```
+ln -sfn ~/src/tend/skills/tend ~/.claude/skills/tend
+```
+
 ## Other accounts on this Mac
 
 Tend keeps sessions running in the account it runs in. If someone else on your

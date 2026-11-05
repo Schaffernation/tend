@@ -14,7 +14,10 @@ add your own apps with `tend apps add`.
 
 Usage:
   tend ls [--json]                 List services and unmanaged tmux sessions.
-  tend new [APP] [--dir D] [--name N] [--no-autostart] [-- COMMAND...]
+  tend folders [--json]            Suggest folders for a new session: recent
+                                   ones, the ones next to them, and their
+                                   parent folders.
+  tend new [APP] [--dir D] [--mkdir] [--name N] [--no-autostart] [-- COMMAND...]
                                    Track and start a new session. Runs the
                                    app's launch command (like `claude rc`), or
                                    COMMAND. Picks a free name from the folder.
@@ -736,6 +739,51 @@ def apps_command(cfg, a):
 
 
 
+# ---------------------------------------------------------------- folders
+
+
+# Folder extensions that macOS shows as a single file, like a Pages document.
+PACKAGES = {
+    ".app", ".bundle", ".framework", ".plugin", ".pages", ".numbers", ".key",
+    ".rtfd", ".photoslibrary", ".xcodeproj", ".xcworkspace", ".playground",
+    ".logicx", ".band", ".fcpbundle", ".imovielibrary", ".dtbase2", ".sparsebundle",
+}
+
+
+def folders(cfg):
+    """Folders to suggest for a new session.
+
+    recent: the folders of tracked services and running tmux sessions.
+    nearby: the other folders next to them, like your other projects, most
+    recently changed first.
+    parents: the folders that hold them, most used first, for a new folder.
+    """
+    recent = sorted({r["dir"] for r in status(cfg, sync=False) if r["dir"]})
+    counts = {}
+    for d in recent:
+        parent = str(Path(d).parent)
+        counts[parent] = counts.get(parent, 0) + 1
+    parents = sorted(counts, key=lambda p: (-counts[p], p))
+    nearby = {}
+    for parent in parents:
+        try:
+            for child in Path(parent).iterdir():
+                if (
+                    child.is_dir()
+                    and not child.name.startswith(".")
+                    and child.suffix.lower() not in PACKAGES
+                    and str(child) not in recent
+                ):
+                    nearby[str(child)] = child.stat().st_mtime
+        except OSError:
+            pass
+    return {
+        "recent": recent,
+        "nearby": sorted(nearby, key=nearby.get, reverse=True),
+        "parents": parents,
+    }
+
+
 # ---------------------------------------------------------------- accounts
 #
 # Other accounts on this Mac that should run their own Tend, like a family member's
@@ -878,6 +926,10 @@ def main():
     sp.add_argument("--name")
     sp.add_argument("--no-autostart", action="store_true")
     sp.add_argument("--command", help="a shell command, typed into the session as is")
+    sp.add_argument("--mkdir", action="store_true", help="create the folder if it doesn't exist")
+
+    sp = sub.add_parser("folders", help="suggest folders for a new session")
+    sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("snapshot")
     sp.add_argument("names", nargs="*")
@@ -946,6 +998,9 @@ def main():
 
     elif a.cmd == "new":
         d = str(Path(a.dir).expanduser().resolve())
+        if a.mkdir and not Path(d).exists():
+            Path(d).mkdir(parents=True)
+            print(f"Created {d}.")
         if not Path(d).is_dir():
             raise TendError(f"{d} isn't a directory.")
         app = None
@@ -1031,6 +1086,18 @@ def main():
 
     elif a.cmd == "apps":
         apps_command(cfg, a)
+
+    elif a.cmd == "folders":
+        f = folders(cfg)
+        if a.json:
+            json.dump(f, sys.stdout, indent=2)
+            print()
+        else:
+            home = str(HOME)
+            for title in ("recent", "nearby", "parents"):
+                print(f"{title.capitalize()}:")
+                for d in f[title]:
+                    print("  " + d.replace(home, "~", 1))
 
     elif a.cmd == "accounts":
         accounts_command(cfg, a)

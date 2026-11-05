@@ -44,6 +44,9 @@ what's untested).
 - `app/release.sh` builds, signs, notarizes, and packages a disk image.
   `app/make-icon.swift` draws the icon; rerun it after changing the design.
 - Use `.help` tooltips for hover text in the app.
+- `skills/tend/SKILL.md` is a Claude Code skill that drives the CLI, linked
+  from `~/.claude/skills/tend`. When you change a command it uses, update the
+  skill too.
 
 ## Gotchas
 
