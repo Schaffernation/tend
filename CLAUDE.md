@@ -28,8 +28,8 @@ what's untested).
   real `claude rc`.
 - After changing `app/` or `bin/tend`, run `app/build.sh`. It builds a
   universal app, copies `bin/tend` into `Contents/Resources`, installs to
-  `~/Applications/Tend.app`, and reopens the app. Build warnings count as
-  failures. Opening the app runs `tend restore --once`, which starts
+  `/Applications/Tend.app` (shared by every account), and reopens the user's
+  copy. Build warnings count as failures. Opening the app runs `tend restore --once`, which starts
   stopped sessions on the first launch after the Mac starts, so ask the user
   before you install.
 - To test with a tmux server separate from the user's, run `unset TMUX` and set

@@ -1,12 +1,18 @@
 #!/bin/zsh
 # Build Tend.app, a universal (Apple silicon and Intel) app with the tend CLI
-# inside it, and install it in ~/Applications.
+# inside it, and install it in /Applications, where every account on this Mac
+# can open it.
 #
 # Usage: app/build.sh [--no-install] [--release]
 #   --no-install  Build app/build/Tend.app only.
-#   --release     Sign with your Developer ID and the hardened runtime, for
-#                 notarization. Without it, the build is signed ad hoc, which
-#                 runs only on this Mac. release.sh uses this flag.
+#   --release     Fail if no Developer ID certificate is available.
+#                 release.sh uses this flag.
+#
+# The build is signed with your Developer ID and the hardened runtime when the
+# certificate is in your keychain, and ad hoc otherwise. A Developer ID
+# signature stays the same across builds, so macOS keeps each account's
+# notification and automation permissions. Set TEND_SIGN_IDENTITY to choose a
+# certificate; otherwise a SchafferNation LLC certificate wins over others.
 
 emulate -L zsh
 setopt err_exit no_unset
@@ -38,23 +44,31 @@ for arch in arm64 x86_64; do
 done
 lipo -create -output $app/Contents/MacOS/Tend $build/arch/Tend-arm64 $build/arch/Tend-x86_64
 
-if (( release )); then
-  identity=${TEND_SIGN_IDENTITY:-"Developer ID Application"}
+identities=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2}')
+identity=${TEND_SIGN_IDENTITY:-$(print -r -- $identities | grep -i schaffernation | head -1)}
+identity=${identity:-$(print -r -- $identities | head -1)}
+if [[ -n $identity ]]; then
   codesign --force --options runtime --timestamp \
     --entitlements $here/Tend.entitlements \
     --sign $identity $app
-  codesign --verify --strict --verbose=2 $app
+  codesign --verify --strict $app
+  print "Signed with $identity"
+elif (( release )); then
+  print -u2 "build.sh: no Developer ID Application certificate in your keychain."
+  exit 1
 else
   codesign --force --sign - $app
+  print "Signed ad hoc. It runs only on this Mac."
 fi
 
 if (( install )); then
-  mkdir -p ~/Applications
-  pkill -x Tend 2>/dev/null || true
-  rm -rf ~/Applications/Tend.app
-  cp -R $app ~/Applications/
-  open ~/Applications/Tend.app
-  print "Installed ~/Applications/Tend.app and opened it."
+  # Only your own Tend quits. Other accounts keep running theirs until they
+  # next open it.
+  pkill -x -u $(id -u) Tend 2>/dev/null || true
+  rm -rf /Applications/Tend.app
+  cp -R $app /Applications/
+  open /Applications/Tend.app
+  print "Installed /Applications/Tend.app and opened it."
 else
   print "Built $app"
 fi

@@ -42,7 +42,7 @@ tend/app/build.sh
 ln -sfn "$PWD/tend/bin/tend" ~/.local/bin/tend
 ```
 
-`build.sh` installs the app in `~/Applications` and opens it.
+`build.sh` installs the app in `/Applications` and opens it.
 
 ## Open sessions with iTerm2's tmux integration
 
