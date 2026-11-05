@@ -9,6 +9,7 @@
 
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 /// The app tend recognized in a session.
 struct AppInfo: Decodable, Hashable {
@@ -42,6 +43,27 @@ struct TerminalSettings: Decodable, Hashable {
     let presets: [String: String]
 }
 
+/// Another account on this Mac that should run its own Tend. Decoded from
+/// `tend accounts --json` with snake-case keys converted.
+struct AccountStatus: Decodable, Identifiable, Hashable {
+    let user: String
+    let name: String
+    let loggedIn: Bool
+    let tendRunning: Bool
+    let ok: Bool
+    let problem: String?
+    var id: String { user }
+}
+
+struct Accounts: Decodable {
+    struct Available: Decodable, Hashable {
+        let user: String
+        let name: String
+    }
+    let watched: [AccountStatus]
+    let available: [Available]
+}
+
 struct Service: Decodable, Identifiable, Hashable {
     let name: String
     let dir: String
@@ -61,6 +83,15 @@ final class Model: ObservableObject {
     @Published var error: String?
     @Published var apps: [AppProfile] = []
     @Published var terminal: TerminalSettings?
+    @Published var accounts: Accounts?
+
+    /// When each watched account's problem started, and which problems Tend
+    /// has already posted a notification for.
+    private var problemSince: [String: Date] = [:]
+    private var notified: Set<String> = []
+    /// How long a problem lasts before Tend posts a notification. It gives
+    /// someone time to log in after a restart before Tend nags.
+    static let notifyAfter: TimeInterval = 60
     @Published var busy = false
     /// The new-session form. Kept here, not in the view, so it survives the
     /// panel closing while a folder picker is open.
@@ -123,6 +154,7 @@ final class Model: ObservableObject {
 
     var runningCount: Int { services.filter { $0.state == "running" }.count }
     var anyBusy: Bool { services.contains { $0.app?.status == "busy" } }
+    var accountProblems: [AccountStatus] { accounts?.watched.filter { !$0.ok } ?? [] }
 
     @discardableResult
     func run(_ args: [String]) async -> Data? {
@@ -153,14 +185,56 @@ final class Model: ObservableObject {
 
     func refresh() async {
         guard let data = await run(["ls", "--json"]),
-              let appData = await run(["apps", "--json"]) else { return }
+              let appData = await run(["apps", "--json"]),
+              let accountData = await run(["accounts", "--json"]) else { return }
         do {
             services = try JSONDecoder().decode([Service].self, from: data)
             apps = try JSONDecoder().decode([AppProfile].self, from: appData)
+            let snake = JSONDecoder()
+            snake.keyDecodingStrategy = .convertFromSnakeCase
+            accounts = try snake.decode(Accounts.self, from: accountData)
+            checkAccounts()
             error = nil
         } catch {
             self.error = "Couldn't read tend's output: \(error.localizedDescription)"
         }
+    }
+
+    /// Post one notification for each account problem that lasts longer
+    /// than `notifyAfter`. Once the account is fine again, a new problem
+    /// notifies again.
+    func checkAccounts() {
+        let now = Date()
+        for account in accounts?.watched ?? [] {
+            guard !account.ok, let problem = account.problem else {
+                problemSince[account.user] = nil
+                notified.remove(account.user)
+                continue
+            }
+            let since = problemSince[account.user] ?? now
+            problemSince[account.user] = since
+            if now.timeIntervalSince(since) >= Model.notifyAfter && !notified.contains(account.user) {
+                notified.insert(account.user)
+                Model.notify(id: "account-\(account.user)", title: "Log in \(account.name)", body: problem
+                    + " To log in, choose their account from the user menu in the menu bar or Control Center.")
+            }
+        }
+    }
+
+    static func notify(id: String, title: String, body: String) {
+        Task {
+            let center = UNUserNotificationCenter.current()
+            guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .default
+            try? await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+        }
+    }
+
+    func watchAccount(_ user: String, _ on: Bool) {
+        act(["accounts", on ? "add" : "rm", user])
     }
 
     func loadTerminal() async {
@@ -238,6 +312,9 @@ struct TendApp: App {
             ContentView().environmentObject(model)
         } label: {
             Image(systemName: model.anyBusy ? "terminal.fill" : "terminal")
+            if !model.accountProblems.isEmpty {
+                Image(systemName: "person.crop.circle.badge.exclamationmark")
+            }
             if model.runningCount > 0 { Text("\(model.runningCount)") }
         }
         .menuBarExtraStyle(.window)
@@ -273,6 +350,13 @@ struct ContentView: View {
                 Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
             }
 
+            ForEach(model.accountProblems) { account in
+                Label(account.problem ?? "", systemImage: "person.crop.circle.badge.exclamationmark")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .help("To log \(account.name) in, choose their account from the user menu in the menu bar or Control Center. Their Tend then restarts their sessions.")
+            }
+
             if model.services.isEmpty {
                 Text("No services. Start a tmux session, then choose Track running sessions.")
                     .font(.callout).foregroundStyle(.secondary)
@@ -304,6 +388,7 @@ struct ContentView: View {
 
             AppsSection()
             TerminalSection()
+            AccountsSection()
 
             Toggle("Restore after the Mac starts", isOn: model.$restoreOnLaunch)
                 .help("The first time Tend opens after the Mac starts, start every tracked session that's set to restore. If you quit Tend or it crashes, your sessions keep running, and opening Tend again doesn't start or stop anything.")
@@ -669,5 +754,50 @@ struct TerminalSection: View {
     func saveCustom() {
         editingCustom = false
         model.setTerminal(attach: custom)
+    }
+}
+
+/// Other accounts on this Mac, like a family member's under fast user switching.
+/// Tend warns when a watched account isn't logged in or isn't running Tend,
+/// because then that account's sessions aren't running.
+struct AccountsSection: View {
+    @EnvironmentObject var model: Model
+    @State private var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(model.accounts?.watched ?? []) { account in
+                    HStack {
+                        Circle().fill(account.ok ? Color.green : Color.orange).frame(width: 8, height: 8)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(account.name)
+                            Text(account.ok ? "Tend is running."
+                                 : account.loggedIn ? "Logged in, but Tend isn't running." : "Not logged in.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button { model.watchAccount(account.user, false) } label: { Image(systemName: "minus.circle") }
+                            .buttonStyle(.borderless)
+                            .help("Stop watching \(account.name)'s account")
+                    }
+                }
+                let available = model.accounts?.available ?? []
+                if available.isEmpty && (model.accounts?.watched.isEmpty ?? true) {
+                    Text("This Mac has no other accounts.").font(.caption).foregroundStyle(.secondary)
+                } else if !available.isEmpty {
+                    Menu("Watch an account") {
+                        ForEach(available, id: \.self) { a in
+                            Button(a.name) { model.watchAccount(a.user, true) }
+                        }
+                    }
+                    .fixedSize()
+                    .help("Warn me when this account isn't logged in or isn't running Tend. Install Tend in that account too, with Open Tend at login on.")
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Text("Other accounts").help("Check that Tend runs in other accounts on this Mac, so their sessions run too")
+        }
     }
 }

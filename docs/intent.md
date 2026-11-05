@@ -74,6 +74,21 @@ the Mac starts. The tmux server doesn't depend on the app, so a crash or
 relaunch of the app must not touch sessions: a session you stopped on purpose
 stays stopped. `tend restore` without `--once` always restores.
 
+### Other accounts
+
+Each account runs its own Tend, and each Tend keeps only its own account's
+sessions alive. We considered running another account's sessions from this
+one, as a system launch daemon with that account's user. We chose not to:
+that account's login keychain stays locked without a login, so Claude Code
+needs a separate token. Background processes can't get macOS privacy
+permissions. Apps that need a desktop, like Photos, can't run at all.
+
+Instead, `tend accounts` watches other accounts and warns when one isn't
+logged in or isn't running Tend. macOS can't log a second account in on its
+own, so a person still logs it in after a restart. The check uses only the
+process list (`pgrep -u USER loginwindow` and `Tend`), so it needs no shared
+files and no access to the other account.
+
 ### How detection works
 
 Each status check (`tend ls`) combines three sources:

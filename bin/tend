@@ -30,6 +30,10 @@ Usage:
                                    With --once, do nothing if tend already
                                    restored since the Mac started.
   tend autostart NAME on|off       Turn restore-at-login on or off.
+  tend accounts [add|rm USER] [--json]
+                                   Watch other accounts on this Mac, and
+                                   warn when one isn't logged in or isn't
+                                   running Tend.
   tend apps [--json]               List the apps tend recognizes (Claude is built in).
   tend apps add PROGRAM [--id ID] [--name NAME]
                                    Recognize another program, by name or path.
@@ -54,6 +58,7 @@ import fnmatch
 import glob
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -731,6 +736,104 @@ def apps_command(cfg, a):
 
 
 
+# ---------------------------------------------------------------- accounts
+#
+# Other accounts on this Mac that should run their own Tend, like a family member's
+# account under fast user switching. tend can't see inside another account,
+# but it can see which processes that user runs: a loginwindow process means
+# the user is logged in, and a Tend process means their Tend is running.
+
+
+def local_users():
+    """People's accounts on this Mac, except the current one: {user: full name}."""
+    r = subprocess.run(["dscl", ".", "list", "/Users", "UniqueID"], capture_output=True, text=True)
+    me = pwd.getpwuid(os.getuid()).pw_name
+    users = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) >= 500:
+            user = parts[0]
+            if user != me and not user.startswith("_"):
+                users[user] = full_name(user)
+    return users
+
+
+def full_name(user):
+    try:
+        return pwd.getpwnam(user).pw_gecos or user
+    except KeyError:
+        return user
+
+
+def runs(user, process):
+    r = subprocess.run(["pgrep", "-x", "-u", user, process], capture_output=True)
+    return r.returncode == 0
+
+
+def account_status(user):
+    logged_in = runs(user, "loginwindow")
+    tend_running = logged_in and runs(user, "Tend")
+    st = {
+        "user": user,
+        "name": full_name(user),
+        "logged_in": logged_in,
+        "tend_running": tend_running,
+        "ok": tend_running,
+    }
+    st["problem"] = account_problem(st)
+    return st
+
+
+def account_problem(a):
+    if not a["logged_in"]:
+        return f"{a['name']} isn't logged in, so their sessions aren't running."
+    if not a["tend_running"]:
+        return f"Tend isn't running for {a['name']}, so their sessions won't restart."
+    return None
+
+
+def accounts_command(cfg, a):
+    watched = cfg.setdefault("accounts", [])
+    if a.action == "add":
+        if not a.user:
+            raise TendError("give a user name. Run `tend accounts` to see them.")
+        users = local_users()
+        if a.user not in users:
+            raise TendError(
+                f"no other account named '{a.user}'. Accounts: {', '.join(users) or 'none'}."
+            )
+        if a.user not in watched:
+            watched.append(a.user)
+            save(cfg)
+        print(f"Watching {users[a.user]}'s account.")
+        return
+    if a.action == "rm":
+        if a.user not in watched:
+            raise TendError(f"'{a.user}' isn't on the list.")
+        watched.remove(a.user)
+        save(cfg)
+        print(f"Stopped watching {full_name(a.user)}'s account.")
+        return
+
+    statuses = [account_status(u) for u in watched]
+    if a.json:
+        available = [{"user": u, "name": n} for u, n in local_users().items() if u not in watched]
+        json.dump({"watched": statuses, "available": available}, sys.stdout, indent=2)
+        print()
+        return
+    if not statuses:
+        print("No accounts watched. Add one with `tend accounts add USER`.")
+    for st in statuses:
+        print(f"{st['user']}: {st['problem'] or 'Tend is running.'}")
+
+
+def print_account_problems(cfg):
+    for user in cfg.get("accounts", []):
+        problem = account_status(user)["problem"]
+        if problem:
+            print(f"Warning: {problem}")
+
+
 def print_table(rows):
     if not rows:
         print("No services and no tmux sessions. Track one with `tend add`.")
@@ -813,6 +916,13 @@ def main():
     )
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser(
+        "accounts", help="watch other accounts on this Mac, to check that Tend runs there"
+    )
+    sp.add_argument("action", nargs="?", choices=["ls", "add", "rm"], default="ls")
+    sp.add_argument("user", nargs="?", help="the account's short user name")
+    sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("autostart")
     sp.add_argument("name")
     sp.add_argument("value", choices=["on", "off"])
@@ -832,6 +942,7 @@ def main():
             print()
         else:
             print_table(rows)
+            print_account_problems(cfg)
 
     elif a.cmd == "new":
         d = str(Path(a.dir).expanduser().resolve())
@@ -920,6 +1031,9 @@ def main():
 
     elif a.cmd == "apps":
         apps_command(cfg, a)
+
+    elif a.cmd == "accounts":
+        accounts_command(cfg, a)
 
     elif a.cmd == "autostart":
         need(cfg, a.name)["autostart"] = a.value == "on"

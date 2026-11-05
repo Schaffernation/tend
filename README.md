@@ -86,6 +86,30 @@ tend ls
 For all commands, run `tend --help`. Your sessions and apps are stored in
 `~/.config/tend/services.json`.
 
+## Other accounts on this Mac
+
+Tend keeps sessions running in the account it runs in. If someone else on your
+Mac has sessions too, like a family member who uses fast user switching, install
+Tend in their account as well, with **Open Tend at login** on. After a restart,
+their sessions come back once they log in.
+
+macOS logs in only one account after a restart, so their account stays logged
+out until someone logs it in. Your Tend can remind you. In the Tend panel,
+open **Other accounts** and choose **Watch an account**. Or run:
+
+```
+tend accounts add USER
+```
+
+When a watched account isn't logged in, or is logged in without Tend running,
+the menu bar icon shows a warning and the panel says what's wrong. If the
+problem lasts a minute, Tend posts a notification. `tend ls` prints the same
+warning.
+
+Tend checks other accounts by looking for their processes: `loginwindow` means
+the account is logged in, and `Tend` means its Tend is running. It doesn't
+read anything in the other account.
+
 ## Release
 
 To build a signed, notarized disk image, run `app/release.sh`. The script

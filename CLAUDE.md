@@ -32,8 +32,12 @@ what's untested).
   failures. Opening the app runs `tend restore --once`, which starts
   stopped sessions on the first launch after the Mac starts, so ask the user
   before you install.
-- To test with a tmux server separate from the user's, also set `TMUX_TMPDIR` to
-  a scratch folder. `open -n --env TEND_CONFIG=... --env TMUX_TMPDIR=...
+- To test with a tmux server separate from the user's, run `unset TMUX` and set
+  `TMUX_TMPDIR` to a short folder path. Inside a tmux session, `TMUX` points
+  every tmux command at the user's real server, whatever `TMUX_TMPDIR` says. tmux
+  socket paths must be under about 100 characters, so a deep scratch folder
+  fails. Check with `tmux display -p '#{socket_path}'` before you change
+  anything. `open -n --env TEND_CONFIG=... --env TMUX_TMPDIR=...
   app/build/Tend.app` runs a built app against that setup.
 - The app runs its bundled copy of `tend`, not `~/.local/bin/tend`. On the user's
   Mac, `~/.local/bin/tend` links to `bin/tend` for the terminal.
