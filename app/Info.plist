@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key>
-  <string>io.github.schaffernation.tend</string>
+  <string>com.schaffernation.tend</string>
   <key>CFBundleName</key>
   <string>Tend</string>
   <key>CFBundleDisplayName</key>

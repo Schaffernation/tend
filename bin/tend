@@ -26,7 +26,9 @@ Usage:
   tend start NAME [--fresh]        Start a service. Resumes Claude unless --fresh.
   tend stop NAME                   Kill the service's tmux session.
   tend restart NAME [--fresh]      Stop, then start.
-  tend restore                     Start every autostart service that isn't running.
+  tend restore [--once]            Start every autostart service that isn't running.
+                                   With --once, do nothing if tend already
+                                   restored since the Mac started.
   tend autostart NAME on|off       Turn restore-at-login on or off.
   tend apps [--json]               List the apps tend recognizes (Claude is built in).
   tend apps add PROGRAM [--id ID] [--name NAME]
@@ -113,6 +115,35 @@ def save(cfg):
     tmp = CONFIG.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, indent=2) + "\n")
     tmp.replace(CONFIG)
+
+
+# State that tend keeps for itself, next to the config.
+STATE = CONFIG.with_name("state.json")
+
+
+def boot_time():
+    """When this Mac last started, in seconds since the epoch, or None."""
+    r = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True)
+    m = re.search(r"sec = (\d+)", r.stdout)
+    return int(m.group(1)) if m else None
+
+
+def restored_this_boot():
+    boot = boot_time()
+    try:
+        return boot is not None and json.loads(STATE.read_text()).get("restored_boot") == boot
+    except (OSError, ValueError):
+        return False
+
+
+def mark_restored():
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        state = {}
+    state["restored_boot"] = boot_time()
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(state, indent=2) + "\n")
 
 
 def find(cfg, name):
@@ -760,7 +791,12 @@ def main():
     for c in ("stop", "attach", "open"):
         sub.add_parser(c).add_argument("name")
 
-    sub.add_parser("restore")
+    sp = sub.add_parser("restore")
+    sp.add_argument(
+        "--once",
+        action="store_true",
+        help="do nothing if tend already restored since the Mac started",
+    )
 
     sp = sub.add_parser("apps", help="list or change the apps tend recognizes")
     sp.add_argument("action", nargs="?", choices=["ls", "add", "rm", "enable", "disable"], default="ls")
@@ -869,6 +905,10 @@ def main():
         print(start(cfg, s, a.fresh))
 
     elif a.cmd == "restore":
+        if a.once and restored_this_boot():
+            print("Already restored since the Mac started. Nothing to do.")
+            return
+        mark_restored()
         todo = [s for s in cfg["services"] if s.get("autostart", True) and not has_session(s["name"])]
         for s in todo:
             try:

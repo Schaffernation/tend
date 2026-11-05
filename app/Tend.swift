@@ -110,7 +110,9 @@ final class Model: ObservableObject {
             return
         }
         Task {
-            if restoreOnLaunch { await run(["restore"]) }
+            // Restore only on the first launch since the Mac started. A
+            // relaunch, like after a crash, checks in and changes nothing.
+            if restoreOnLaunch { await run(["restore", "--once"]) }
             await loadTerminal()
             while true {
                 await refresh()
@@ -303,10 +305,10 @@ struct ContentView: View {
             AppsSection()
             TerminalSection()
 
-            Toggle("Restore when Tend opens", isOn: model.$restoreOnLaunch)
-                .help("When Tend opens, start every tracked session that's set to restore.")
+            Toggle("Restore after the Mac starts", isOn: model.$restoreOnLaunch)
+                .help("The first time Tend opens after the Mac starts, start every tracked session that's set to restore. If you quit Tend or it crashes, your sessions keep running, and opening Tend again doesn't start or stop anything.")
             Toggle("Open Tend at login", isOn: $openAtLogin)
-                .help("Open Tend when you log in. With the setting above, this restores your sessions at login.")
+                .help("Open Tend when you log in. With the setting above, this restores your sessions after the Mac starts.")
                 .onChange(of: openAtLogin) { _, on in
                     do {
                         if on { try SMAppService.mainApp.register() }

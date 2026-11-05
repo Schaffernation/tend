@@ -66,6 +66,14 @@ the `com.example.tmux-server` launch agent (the config's `tmux_launch_agent`), s
 that sessions created over ssh can still read the login keychain. That
 agent's source is in `~/Library/LaunchAgents/`.
 
+### Restoring once per boot
+
+The app runs `tend restore --once` when it opens. tend records the boot time
+in `state.json`, next to the config, and restores only on the first run after
+the Mac starts. The tmux server doesn't depend on the app, so a crash or
+relaunch of the app must not touch sessions: a session you stopped on purpose
+stays stopped. `tend restore` without `--once` always restores.
+
 ### How detection works
 
 Each status check (`tend ls`) combines three sources:

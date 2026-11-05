@@ -27,8 +27,10 @@ Tend has two parts:
    [Releases](https://github.com/Schaffernation/tend/releases), open it, and
    drag Tend to **Applications**.
 2. Open Tend. It appears in the menu bar.
-3. In the Tend panel, turn on **Open Tend at login**. Tend restores your
-   sessions each time it opens.
+3. In the Tend panel, turn on **Open Tend at login**. The first time Tend
+   opens after your Mac starts, it restores your sessions. If you quit Tend
+   or it crashes, your sessions keep running, and opening Tend again doesn't
+   start or stop anything.
 4. To use `tend` in a terminal, click **Install command-line tool**. It links
    `tend` into `~/.local/bin`, which needs to be on your `PATH`.
 

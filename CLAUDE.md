@@ -29,8 +29,12 @@ what's untested).
 - After changing `app/` or `bin/tend`, run `app/build.sh`. It builds a
   universal app, copies `bin/tend` into `Contents/Resources`, installs to
   `~/Applications/Tend.app`, and reopens the app. Build warnings count as
-  failures. Reopening the app runs `tend restore` if **Restore when Tend
-  opens** is on, so ask the user before you install.
+  failures. Opening the app runs `tend restore --once`, which starts
+  stopped sessions on the first launch after the Mac starts, so ask the user
+  before you install.
+- To test with a tmux server separate from the user's, also set `TMUX_TMPDIR` to
+  a scratch folder. `open -n --env TEND_CONFIG=... --env TMUX_TMPDIR=...
+  app/build/Tend.app` runs a built app against that setup.
 - The app runs its bundled copy of `tend`, not `~/.local/bin/tend`. On the user's
   Mac, `~/.local/bin/tend` links to `bin/tend` for the terminal.
 - `app/release.sh` builds, signs, notarizes, and packages a disk image.
