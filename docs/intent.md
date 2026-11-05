@@ -116,6 +116,18 @@ deliberate.
   before, and `--continue` is the other option. Both reconnect in
   single-session mode, which grays out the plus button, and `--continue` only
   works for about 4 hours.
+- Remote Control forgets an environment after a while, and then a plain
+  restart starts a new conversation. So tend records every conversation ID it
+  sees in `state.json` (`history`, the last 20 per service), and
+  `tend resume` brings one back with `--session-id`, in single-session mode.
+  A later plain restart returns to server mode and keeps the conversation.
+- After a single-session process stops, Remote Control needs about 45
+  seconds to release the folder; starting sooner fails with "already
+  served". The profile's `release_wait` covers it.
+- Restarting the session tend runs in: tend hands the command to the tmux
+  server with `run-shell -b`, marked with `TEND_HANDED_OFF`, because
+  `run-shell` sets `TMUX` and `TMUX_PANE` and the handed-off command would
+  otherwise hand off again forever.
 - Interactive resume: `claude --resume {sessionId}`.
 - `strip_flags` removes `--continue`, `--session-id`, and `--resume` from the
   saved `command`, so **Start fresh** really is fresh.

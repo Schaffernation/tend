@@ -28,7 +28,15 @@ Usage:
   tend rm NAME [--stop]            Stop tracking a service.
   tend start NAME [--fresh]        Start a service. Resumes Claude unless --fresh.
   tend stop NAME                   Kill the service's tmux session.
-  tend restart NAME [--fresh]      Stop, then start.
+  tend restart NAME [--fresh]      Stop, then start. Works from inside the
+                                   session it restarts.
+  tend history NAME [--json]       List the conversations a service has run
+                                   (Claude Remote Control), newest first.
+  tend resume NAME [ID]            Bring back a past conversation, the latest
+                                   by default, after Remote Control has
+                                   forgotten it. It runs in single-session
+                                   mode; a later restart returns to server
+                                   mode and keeps it.
   tend restore [--once]            Start every autostart service that isn't running.
                                    With --once, do nothing if tend already
                                    restored since the Mac started.
@@ -138,22 +146,62 @@ def boot_time():
     return int(m.group(1)) if m else None
 
 
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    tmp.replace(STATE)
+
+
 def restored_this_boot():
     boot = boot_time()
-    try:
-        return boot is not None and json.loads(STATE.read_text()).get("restored_boot") == boot
-    except (OSError, ValueError):
-        return False
+    return boot is not None and load_state().get("restored_boot") == boot
 
 
 def mark_restored():
-    try:
-        state = json.loads(STATE.read_text())
-    except (OSError, ValueError):
-        state = {}
+    state = load_state()
     state["restored_boot"] = boot_time()
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(state, indent=2) + "\n")
+    save_state(state)
+
+
+HISTORY_LIMIT = 20
+# How often tend refreshes a conversation's last_seen time, in seconds.
+HISTORY_REFRESH = 600
+
+
+def record_history(seen):
+    """Remember the conversations running in each service: {name: [conv]}.
+
+    Each service keeps its last HISTORY_LIMIT conversations, newest first,
+    with when tend first and last saw them.
+    """
+    if not seen:
+        return
+    state = load_state()
+    history = state.setdefault("history", {})
+    now = int(time.time())
+    changed = False
+    for name, convs in seen.items():
+        entries = history.setdefault(name, [])
+        for c in convs:
+            e = next((e for e in entries if e["id"] == c["id"]), None)
+            if e is None:
+                entries.append({"id": c["id"], "label": c["label"], "first_seen": now, "last_seen": now})
+                changed = True
+            elif now - e["last_seen"] >= HISTORY_REFRESH or e.get("label") != c["label"]:
+                e.update(label=c["label"], last_seen=now)
+                changed = True
+        entries.sort(key=lambda e: -e["last_seen"])
+        del entries[HISTORY_LIMIT:]
+    if changed:
+        save_state(state)
 
 
 def find(cfg, name):
@@ -321,6 +369,11 @@ def exe_path(pid, _cache={}):
 #                how many values follow them, so a fresh start stays fresh.
 #   launch       Optional. The command `tend new` runs to start a new
 #                instance, like `claude rc`.
+#   reattach     Optional. The command `tend resume` runs to bring back a
+#                past conversation, with {id} from metadata `id_field`.
+#   release_wait Optional. After tend stops a process started with one of
+#                `args`, it waits `seconds` before starting the app again in
+#                that folder, so the old one can let go of it.
 #   preflight    Optional. A check tend runs before it starts the app in a
 #                folder. The only check so far is "claude-trust".
 #   metadata     Optional. JSON files the program writes about itself:
@@ -328,6 +381,8 @@ def exe_path(pid, _cache={}):
 #     pid_field    Field with the PID of a process in the session. tend
 #                  matches a file to a session by this PID.
 #     status_field, label_field   Fields to show in the app.
+#     id_field     Field with a conversation ID. tend keeps a history of
+#                  these per service, for `tend history` and `tend resume`.
 #     order_field  If several files match a session, the lowest value wins.
 #
 # Only the topmost matching process counts, so a program that starts copies
@@ -352,6 +407,11 @@ BUILTIN_APPS = [
             {"id": "interactive", "resume": "claude --resume {sessionId}"},
         ],
         "launch": "claude rc",
+        # Brings a conversation back after Remote Control has forgotten it,
+        # in single-session mode. A later plain restart returns to server
+        # mode and keeps the conversation.
+        "reattach": "claude remote-control --session-id {id}",
+        "release_wait": {"args": ["--session-id", "-c", "--continue"], "seconds": 45},
         "preflight": "claude-trust",
         "strip_flags": {"-c": 0, "--continue": 0, "--session-id": 1, "-r": 1, "--resume": 1},
         "metadata": {
@@ -359,6 +419,7 @@ BUILTIN_APPS = [
             "pid_field": "pid",
             "status_field": "status",
             "label_field": "name",
+            "id_field": "bridgeSessionId",
             "order_field": "startedAt",
         },
     }
@@ -449,6 +510,12 @@ def describe(app, proc, pids, metadata):
         "resume": resume,
         "instances": len(meta),
         "pid": proc["pid"],
+        "args": a,
+        "conversations": [
+            {"id": d[md["id_field"]], "label": d.get(md.get("label_field", ""))}
+            for d in meta
+            if md.get("id_field") and d.get(md["id_field"])
+        ],
     }
 
 
@@ -509,7 +576,7 @@ def status(cfg, sync=True):
     procs, children = process_table()
     app_list = [a for a in apps(cfg) if a["enabled"]]
     metadata = {a["id"]: read_metadata(a) for a in app_list}
-    rows, changed = [], False
+    rows, changed, conversations = [], False, {}
 
     seen = set()
     for s in cfg["services"]:
@@ -528,6 +595,8 @@ def status(cfg, sync=True):
         if s["name"] in panes:
             info = inspect_session(s["name"], panes[s["name"]], procs, children, app_list, metadata)
             row.update(state=info["state"], attached=info["attached"], app=info["app"])
+            if sync and info["app"] and info["app"]["conversations"]:
+                conversations[s["name"]] = info["app"]["conversations"]
             resume = info["app"] and info["app"]["resume"]
             if sync and resume and resume != s.get("resume"):
                 s["resume"] = row["resume"] = resume
@@ -554,6 +623,7 @@ def status(cfg, sync=True):
 
     if changed:
         save(cfg)
+    record_history(conversations)
     return rows
 
 
@@ -589,13 +659,13 @@ def unique_name(cfg, name):
     return candidate
 
 
-def start(cfg, s, fresh=False):
+def start(cfg, s, fresh=False, command=None):
     if has_session(s["name"]):
         return f"'{s['name']}' is already running."
     if not Path(s["dir"]).is_dir():
         raise TendError(f"{s['dir']} isn't a directory.")
     ensure_server(cfg)
-    cmd = s.get("command") if fresh else (s.get("resume") or s.get("command"))
+    cmd = command or (s.get("command") if fresh else (s.get("resume") or s.get("command")))
     tmux("new-session", "-d", "-s", s["name"], "-c", s["dir"])
     if cmd:
         tmux("send-keys", "-t", f"={s['name']}:", "-l", "--", cmd)
@@ -636,6 +706,59 @@ def open_in_terminal(cfg, name):
     r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if r.returncode:
         raise TendError(r.stderr.strip())
+
+
+def current_session():
+    """The tmux session this process runs in, or None.
+
+    A command handed off to the tmux server runs with TMUX set too, so
+    hand_off marks it with TEND_HANDED_OFF.
+    """
+    if not os.environ.get("TMUX") or os.environ.get("TEND_HANDED_OFF"):
+        return None
+    r = tmux("display-message", "-p", "#S", check=False)
+    return r.stdout.strip() or None
+
+
+def hand_off(argv_tail):
+    """Run this tend command from the tmux server instead of this process.
+
+    Stopping the session tend runs in would end tend before it could start
+    the session again. The tmux server keeps running.
+    """
+    cmd = "TEND_HANDED_OFF=1 " + shlex.join([os.path.realpath(sys.argv[0]), *argv_tail])
+    if "TEND_CONFIG" in os.environ:
+        cmd = f"TEND_CONFIG={shlex.quote(os.environ['TEND_CONFIG'])} {cmd}"
+    tmux("run-shell", "-b", cmd)
+
+
+def stop_for_restart(cfg, name):
+    """Stop a session, then wait if its app needs time to let go of the folder."""
+    row = next((r for r in status(cfg) if r["name"] == name), None)
+    out = stop(name)
+    info = row and row["app"]
+    if info:
+        app = next((x for x in apps(cfg) if x["id"] == info["id"]), {})
+        wait = app.get("release_wait")
+        if wait and any(arg in wait["args"] for arg in info.get("args", [])):
+            print(out)
+            print(f"Waiting {wait['seconds']} seconds for {info['name']} to let go of the folder…")
+            sys.stdout.flush()
+            time.sleep(wait["seconds"])
+            return None
+    return out
+
+
+def history_for(name):
+    return load_state().get("history", {}).get(name, [])
+
+
+def ago(t):
+    d = int(time.time()) - t
+    for unit, n in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if d >= n:
+            return f"{d // n} {unit}{'s' if d // n != 1 else ''} ago"
+    return "just now"
 
 
 def terminal_settings(cfg):
@@ -954,6 +1077,14 @@ def main():
     for c in ("stop", "attach", "open"):
         sub.add_parser(c).add_argument("name")
 
+    sp = sub.add_parser("history", help="list the conversations a service has run")
+    sp.add_argument("name")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("resume", help="bring back a past conversation in a service")
+    sp.add_argument("name")
+    sp.add_argument("id", nargs="?", help="a conversation ID from `tend history` (default: the latest)")
+
     sp = sub.add_parser("restore")
     sp.add_argument(
         "--once",
@@ -1077,9 +1208,49 @@ def main():
 
     elif a.cmd == "restart":
         s = need(cfg, a.name)
-        status(cfg)  # record the latest Claude session before stopping
-        print(stop(a.name))
+        if current_session() == a.name:
+            hand_off(["restart", a.name] + (["--fresh"] if a.fresh else []))
+            print(f"Restarting '{a.name}', the session this runs in. It closes now and starts again shortly.")
+            return
+        out = stop_for_restart(cfg, a.name)  # also records the latest conversation
+        if out:
+            print(out)
         print(start(cfg, s, a.fresh))
+
+    elif a.cmd == "history":
+        need(cfg, a.name)
+        entries = history_for(a.name)
+        if a.json:
+            json.dump(entries, sys.stdout, indent=2)
+            print()
+        elif not entries:
+            print(f"No conversations recorded for '{a.name}' yet.")
+        else:
+            for e in entries:
+                print(f"{e['id']}  {ago(e['last_seen']):>16}  {e.get('label') or ''}")
+
+    elif a.cmd == "resume":
+        s = need(cfg, a.name)
+        app = None
+        for row in status(cfg, sync=False):
+            if row["name"] == a.name and row["app"]:
+                app = next((x for x in apps(cfg) if x["id"] == row["app"]["id"]), None)
+        app = app or next((x for x in apps(cfg) if x.get("reattach")), None)
+        if not app or not app.get("reattach"):
+            raise TendError(f"tend doesn't know how to bring back a conversation in '{a.name}'.")
+        entries = history_for(a.name)
+        conv = a.id or (entries[0]["id"] if entries else None)
+        if not conv:
+            raise TendError(f"no conversations recorded for '{a.name}'. Give an ID.")
+        if current_session() == a.name:
+            hand_off(["resume", a.name, conv])
+            print(f"Resuming {conv} in '{a.name}', the session this runs in. It closes now and starts again shortly.")
+            return
+        if has_session(a.name):
+            out = stop_for_restart(cfg, a.name)
+            if out:
+                print(out)
+        print(start(cfg, s, command=app["reattach"].format(id=conv)))
 
     elif a.cmd == "restore":
         if a.once and restored_this_boot():

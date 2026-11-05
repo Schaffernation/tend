@@ -1,7 +1,7 @@
 ---
 name: tend
 description: Start or manage long-running Claude Code sessions with the `tend` CLI. Use when the user wants a new session in a project folder (existing or new), or wants to list, open, stop, or restart the sessions tend keeps alive.
-argument-hint: "[help | new [FOLDER] | ls | open NAME | stop NAME | restart NAME]"
+argument-hint: "[help | new [FOLDER] | ls | open NAME | stop NAME | restart NAME | resume NAME]"
 ---
 
 # Tend sessions
@@ -13,7 +13,8 @@ flag, run `tend --help`.
 
 Route by the request. With arguments, the first word picks the branch: `new`
 starts a session, `help` shows the menu, and any other `tend` command (`ls`,
-`open`, `stop`, `restart`, `start`, `snapshot`, `autostart`, `rm`) runs under
+`open`, `stop`, `restart`, `start`, `history`, `resume`, `snapshot`,
+`autostart`, `rm`) runs under
 **Manage sessions**. With no arguments and no request, or when the user asks
 what this can do, show the menu.
 
@@ -30,6 +31,7 @@ Show this, then ask what they'd like to do:
 > | `/tend ls` | List your sessions, and whether each Claude is busy or idle |
 > | `/tend open NAME` | Open a session in a terminal window |
 > | `/tend stop NAME`, `/tend restart NAME` | Stop or restart a session (asks you first) |
+> | `/tend resume NAME` | Bring back a conversation that a restart didn't reconnect |
 > | `/tend help` | Show this menu |
 >
 > For example: "start a session in a new folder called recipe-box", "which
@@ -87,6 +89,17 @@ Claude, that's a conversation that may be mid-task. Before `tend stop`,
 when `$TMUX` is set: `tmux display -p '#S'` prints its name, and stopping or
 restarting that one ends this conversation, so say that too.
 
-`tend restart NAME` reattaches Claude to the same conversation;
-`tend restart NAME --fresh` starts a new one. `tend rm NAME` stops tracking a
-session and leaves it running.
+`tend restart NAME` restarts Remote Control in server mode, which reconnects
+its last conversation if Remote Control still remembers it, and lets the
+Claude app start new sessions there. `tend restart NAME --fresh` starts a new
+conversation. Restarting the session you run in works too: tend hands the
+restart to the tmux server, and this conversation reconnects after it. A
+restart from single-session mode waits 45 seconds first; tell the user.
+
+`tend history NAME` lists the conversations a session has run, newest first.
+When a restart started a new conversation instead of reconnecting (Remote
+Control forgets after a while), `tend resume NAME [ID]` brings back the
+latest one, or the given ID, in single-session mode. A later
+`tend restart NAME` returns it to server mode and keeps the conversation.
+
+`tend rm NAME` stops tracking a session and leaves it running.
