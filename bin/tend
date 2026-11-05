@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+"""tend: keep a list of long-running tmux sessions, and restore them.
+
+Each service is a tmux session with a name, a directory, and a command. tend
+starts a login shell in the session and types the command into it, so the
+shell loads your usual environment and stays open if the command exits.
+
+tend recognizes programs from a list of apps. For each tmux session, it
+walks the process tree under the pane's shell and looks for a process that
+matches an app, by executable name or path. Claude Code is built in: when a
+service runs Claude, tend records the Claude session ID, so a restore
+reattaches to the same conversation instead of starting a new one. You can
+add your own apps with `tend apps add`.
+
+Usage:
+  tend ls [--json]                 List services and unmanaged tmux sessions.
+  tend new [APP] [--dir D] [--name N] [--no-autostart] [-- COMMAND...]
+                                   Track and start a new session. Runs the
+                                   app's launch command (like `claude rc`), or
+                                   COMMAND. Picks a free name from the folder.
+  tend add [NAME] [--dir D] [--no-autostart] [--start] [-- COMMAND...]
+                                   Track a service. With no command, tend
+                                   copies the command from a running session.
+  tend snapshot [NAME...]          Track running tmux sessions (default: all).
+  tend rm NAME [--stop]            Stop tracking a service.
+  tend start NAME [--fresh]        Start a service. Resumes Claude unless --fresh.
+  tend stop NAME                   Kill the service's tmux session.
+  tend restart NAME [--fresh]      Stop, then start.
+  tend restore                     Start every autostart service that isn't running.
+  tend autostart NAME on|off       Turn restore-at-login on or off.
+  tend apps [--json]               List the apps tend recognizes (Claude is built in).
+  tend apps add PROGRAM [--id ID] [--name NAME]
+                                   Recognize another program, by name or path.
+  tend apps enable|disable ID      Turn recognition of an app on or off.
+  tend apps rm ID                  Remove an app you added.
+  tend attach NAME                 Attach to the session in this terminal.
+  tend open NAME                   Open the session in a new terminal window.
+
+Config: ~/.config/tend/services.json (override with TEND_CONFIG).
+
+Source: ~/src/tend/bin/tend
+Linked to ~/.local/bin/tend.
+"""
+
+import argparse
+import ctypes
+import fnmatch
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+# ssh commands and GUI apps don't read .zshrc, so set PATH here.
+os.environ["PATH"] = (
+    f"{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+)
+CONFIG = Path(os.environ.get("TEND_CONFIG", HOME / ".config/tend/services.json"))
+SHELLS = {"zsh", "bash", "sh", "fish", "login"}
+
+
+class TendError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- config
+
+
+def default_config():
+    return {
+        # Terminal app for `tend open`: "iTerm" or "Terminal".
+        "terminal": "iTerm" if Path("/Applications/iTerm.app").exists() else "Terminal",
+        # Launch agent that owns the tmux server. If the server isn't running,
+        # tend kickstarts this agent before it starts a session. Set to null
+        # to let tend start the server itself.
+        "tmux_launch_agent": "com.example.tmux-server",
+        "services": [],
+    }
+
+
+def load():
+    if not CONFIG.exists():
+        return default_config()
+    cfg = json.loads(CONFIG.read_text())
+    for k, v in default_config().items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+def save(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp.replace(CONFIG)
+
+
+def find(cfg, name):
+    for s in cfg["services"]:
+        if s["name"] == name:
+            return s
+    return None
+
+
+def need(cfg, name):
+    s = find(cfg, name)
+    if not s:
+        raise TendError(f"no service named '{name}'. Run `tend ls` to see them.")
+    return s
+
+
+def session_name(text):
+    # tmux session names can't contain . or :
+    return re.sub(r"[.:]", "-", text)
+
+
+# ---------------------------------------------------------------- tmux
+
+
+def tmux(*args, check=True):
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    if check and r.returncode:
+        raise TendError(r.stderr.strip() or f"tmux {args[0]} failed")
+    return r
+
+
+def ensure_server(cfg):
+    """Make sure the tmux server runs in the launch agent, if one is set."""
+    if tmux("info", check=False).returncode == 0:
+        return
+    agent = cfg.get("tmux_launch_agent")
+    if not agent:
+        return
+    target = f"gui/{os.getuid()}/{agent}"
+    subprocess.run(["launchctl", "kickstart", target], capture_output=True)
+    for _ in range(30):
+        if tmux("info", check=False).returncode == 0:
+            return
+        time.sleep(0.1)
+    raise TendError(
+        f"the tmux server isn't running, and the {agent} launch agent didn't start it. "
+        f"Check it with: launchctl print {target}"
+    )
+
+
+def has_session(name):
+    return tmux("has-session", "-t", f"={name}", check=False).returncode == 0
+
+
+def tmux_panes():
+    """Return {session: [pane, ...]}, with the first pane first."""
+    fmt = "\t".join(
+        [
+            "#{session_name}",
+            "#{window_index}",
+            "#{pane_index}",
+            "#{pane_pid}",
+            "#{pane_current_command}",
+            "#{pane_current_path}",
+            "#{session_attached}",
+            "#{session_created}",
+        ]
+    )
+    r = tmux("list-panes", "-a", "-F", fmt, check=False)
+    if r.returncode:
+        return {}
+    sessions = {}
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 8:
+            continue
+        sess, win, pane, pid, cmd, path, attached, created = parts
+        sessions.setdefault(sess, []).append(
+            {
+                "window": int(win),
+                "pane": int(pane),
+                "pid": int(pid),
+                "cmd": cmd,
+                "path": path,
+                "attached": attached != "0",
+                "created": int(created),
+            }
+        )
+    for panes in sessions.values():
+        panes.sort(key=lambda p: (p["window"], p["pane"]))
+    return sessions
+
+
+# ---------------------------------------------------------------- processes
+
+
+def process_table():
+    r = subprocess.run(
+        ["ps", "-ax", "-o", "pid=,ppid=,command="], capture_output=True, text=True
+    )
+    procs, children = {}, {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        pid, ppid = int(parts[0]), int(parts[1])
+        procs[pid] = {"pid": pid, "ppid": ppid, "command": parts[2] if len(parts) > 2 else ""}
+        children.setdefault(ppid, []).append(pid)
+    for kids in children.values():
+        kids.sort()
+    return procs, children
+
+
+def argv(command):
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def descendants(pid, children):
+    out, queue = [], list(children.get(pid, []))
+    while queue:
+        p = queue.pop(0)
+        out.append(p)
+        queue.extend(children.get(p, []))
+    return out
+
+
+try:
+    _libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+except OSError:
+    _libproc = None
+
+
+def exe_path(pid, _cache={}):
+    """Return the real path of a process's executable, like /bin/zsh."""
+    if pid not in _cache:
+        path = ""
+        if _libproc:
+            buf = ctypes.create_string_buffer(4096)
+            if _libproc.proc_pidpath(pid, buf, 4096) > 0:
+                path = buf.value.decode(errors="replace")
+        _cache[pid] = path
+    return _cache[pid]
+
+
+# ---------------------------------------------------------------- apps
+#
+# An app tells tend how to recognize a program in a tmux session, and,
+# optionally, how to read its state and resume it. Fields:
+#
+#   id, name     Short ID and display name.
+#   match        How to recognize the process. It matches if any rule does:
+#     names        Executable names, compared with argv[0] and the real
+#                  executable's file name.
+#     paths        Glob patterns, compared with the real executable path.
+#   modes        Optional. The first mode whose `args` contains argv[1]
+#                wins; a mode without `args` matches anything. A mode can set
+#                `resume`, a command template filled in from the metadata.
+#   strip_flags  Optional. Flags to drop from the saved command, mapped to
+#                how many values follow them, so a fresh start stays fresh.
+#   launch       Optional. The command `tend new` runs to start a new
+#                instance, like `claude rc`.
+#   preflight    Optional. A check tend runs before it starts the app in a
+#                folder. The only check so far is "claude-trust".
+#   metadata     Optional. JSON files the program writes about itself:
+#     glob         Files to read.
+#     pid_field    Field with the PID of a process in the session. tend
+#                  matches a file to a session by this PID.
+#     status_field, label_field   Fields to show in the app.
+#     order_field  If several files match a session, the lowest value wins.
+#
+# Only the topmost matching process counts, so a program that starts copies
+# of itself shows up once.
+
+BUILTIN_APPS = [
+    {
+        "id": "claude",
+        "name": "Claude",
+        "match": {"names": ["claude"], "paths": ["*/claude/versions/*"]},
+        "modes": [
+            {
+                "id": "remote-control",
+                "args": ["rc", "remote-control"],
+                "resume": "claude remote-control --session-id {bridgeSessionId}",
+            },
+            {"id": "interactive", "resume": "claude --resume {sessionId}"},
+        ],
+        "launch": "claude rc",
+        "preflight": "claude-trust",
+        "strip_flags": {"-c": 0, "--continue": 0, "--session-id": 1, "-r": 1, "--resume": 1},
+        "metadata": {
+            "glob": "~/.claude/sessions/*.json",
+            "pid_field": "pid",
+            "status_field": "status",
+            "label_field": "name",
+            "order_field": "startedAt",
+        },
+    }
+]
+
+
+def apps(cfg):
+    """Built-in apps with your changes applied, then your own apps."""
+    custom = {a["id"]: a for a in cfg.get("apps", [])}
+    out = []
+    for b in BUILTIN_APPS:
+        out.append({**b, **custom.pop(b["id"], {}), "builtin": True})
+    out.extend({**a, "builtin": False} for a in custom.values())
+    for a in out:
+        a.setdefault("enabled", True)
+    return out
+
+
+def matches(app, proc):
+    a = argv(proc["command"])
+    m = app.get("match", {})
+    exe = exe_path(proc["pid"])
+    names = set(m.get("names", []))
+    if a and os.path.basename(a[0]).lstrip("-") in names:
+        return True
+    if exe and os.path.basename(exe) in names:
+        return True
+    return bool(exe) and any(fnmatch.fnmatch(exe, g) for g in m.get("paths", []))
+
+
+def read_metadata(app):
+    md = app.get("metadata")
+    if not md:
+        return []
+    out = []
+    for f in glob.glob(os.path.expanduser(md["glob"])):
+        try:
+            d = json.loads(Path(f).read_text())
+            d["_pid"] = int(d[md.get("pid_field", "pid")])
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+        out.append(d)
+    return out
+
+
+def describe(app, proc, pids, metadata):
+    """What tend knows about one running app."""
+    a = argv(proc["command"])
+    mode = next(
+        (
+            m
+            for m in app.get("modes", [])
+            if "args" not in m or (len(a) > 1 and a[1] in m["args"])
+        ),
+        {},
+    )
+    md = app.get("metadata") or {}
+    meta = sorted(
+        (d for d in metadata if d["_pid"] in pids),
+        key=lambda d: d.get(md.get("order_field", "_pid"), 0),
+    )
+    m = meta[0] if meta else {}
+
+    resume = None
+    if mode.get("resume") and m:
+        try:
+            resume = mode["resume"].format_map(m)
+        except (KeyError, IndexError, ValueError):
+            pass
+
+    # Drop resume flags, so the saved command always starts fresh.
+    strip = app.get("strip_flags", {})
+    base, skip = a[:1], 0
+    for arg in a[1:]:
+        if skip:
+            skip -= 1
+        elif arg in strip:
+            skip = strip[arg]
+        elif not any(arg.startswith(f + "=") for f in strip if f.startswith("--")):
+            base.append(arg)
+    return {
+        "id": app["id"],
+        "name": app.get("name", app["id"]),
+        "mode": mode.get("id"),
+        "command": shlex.join(base),
+        "status": m.get(md.get("status_field", ""), None),
+        "label": m.get(md.get("label_field", ""), None),
+        "resume": resume,
+        "instances": len(meta),
+        "pid": proc["pid"],
+    }
+
+
+def inspect_session(name, panes, procs, children, app_list, metadata):
+    """Work out what runs in a tmux session."""
+    main = panes[0]
+    kids = children.get(main["pid"], [])
+    foreground = procs[kids[0]]["command"] if kids else None
+
+    found = None
+    for pane in panes:
+        pids = descendants(pane["pid"], children)
+        for pid in pids:
+            p = procs.get(pid)
+            if not p:
+                continue
+            for app in app_list:
+                # Skip a process whose parent is the same app: the topmost
+                # one is the command you typed.
+                parent = procs.get(p["ppid"])
+                if matches(app, p) and not (parent and matches(app, parent)):
+                    found = describe(app, p, set(pids), metadata.get(app["id"], []))
+                    break
+            if found:
+                break
+        if found:
+            break
+
+    return {
+        "state": "running" if found or foreground else "exited",
+        "foreground": foreground,
+        "path": main["path"],
+        "attached": any(p["attached"] for p in panes),
+        "app": found,
+    }
+
+
+def detected_command(info):
+    if info["app"]:
+        return info["app"]["command"]
+    fg = info["foreground"]
+    if fg and os.path.basename(argv(fg)[0]).lstrip("-") not in SHELLS:
+        return fg
+    return None
+
+
+# ---------------------------------------------------------------- status
+
+
+def status(cfg, sync=True):
+    """Return a row per service and per unmanaged tmux session.
+
+    With sync, tend records the resume command of each running service (for
+    Claude, the session ID), so a later restore reattaches to the latest
+    conversation.
+    """
+    panes = tmux_panes()
+    procs, children = process_table()
+    app_list = [a for a in apps(cfg) if a["enabled"]]
+    metadata = {a["id"]: read_metadata(a) for a in app_list}
+    rows, changed = [], False
+
+    seen = set()
+    for s in cfg["services"]:
+        seen.add(s["name"])
+        row = {
+            "name": s["name"],
+            "dir": s["dir"],
+            "command": s.get("command"),
+            "resume": s.get("resume"),
+            "autostart": s.get("autostart", True),
+            "managed": True,
+            "state": "stopped",
+            "attached": False,
+            "app": None,
+        }
+        if s["name"] in panes:
+            info = inspect_session(s["name"], panes[s["name"]], procs, children, app_list, metadata)
+            row.update(state=info["state"], attached=info["attached"], app=info["app"])
+            resume = info["app"] and info["app"]["resume"]
+            if sync and resume and resume != s.get("resume"):
+                s["resume"] = row["resume"] = resume
+                changed = True
+        rows.append(row)
+
+    for name, sp in sorted(panes.items()):
+        if name in seen:
+            continue
+        info = inspect_session(name, sp, procs, children, app_list, metadata)
+        rows.append(
+            {
+                "name": name,
+                "dir": info["path"],
+                "command": detected_command(info),
+                "resume": info["app"] and info["app"]["resume"],
+                "autostart": False,
+                "managed": False,
+                "state": info["state"],
+                "attached": info["attached"],
+                "app": info["app"],
+            }
+        )
+
+    if changed:
+        save(cfg)
+    return rows
+
+
+# ---------------------------------------------------------------- actions
+
+
+def preflight(check, d):
+    """Raise TendError if an app can't start in folder d."""
+    if check == "claude-trust":
+        # claude rc exits right away in a folder you haven't trusted.
+        # Trusting a parent folder counts too.
+        try:
+            projects = json.loads((HOME / ".claude.json").read_text()).get("projects", {})
+        except (OSError, json.JSONDecodeError):
+            return
+        p = d
+        while True:
+            if projects.get(p, {}).get("hasTrustDialogAccepted"):
+                return
+            if p == "/":
+                break
+            p = os.path.dirname(p)
+        raise TendError(
+            f"you haven't trusted {d} in Claude Code yet. Run claude there once, "
+            "accept the trust prompt, and then try again."
+        )
+
+
+def unique_name(cfg, name):
+    candidate, n = name, 2
+    while find(cfg, candidate) or has_session(candidate):
+        candidate, n = f"{name}-{n}", n + 1
+    return candidate
+
+
+def start(cfg, s, fresh=False):
+    if has_session(s["name"]):
+        return f"'{s['name']}' is already running."
+    if not Path(s["dir"]).is_dir():
+        raise TendError(f"{s['dir']} isn't a directory.")
+    ensure_server(cfg)
+    cmd = s.get("command") if fresh else (s.get("resume") or s.get("command"))
+    tmux("new-session", "-d", "-s", s["name"], "-c", s["dir"])
+    if cmd:
+        tmux("send-keys", "-t", f"={s['name']}:", "-l", "--", cmd)
+        tmux("send-keys", "-t", f"={s['name']}:", "Enter")
+    return f"Started '{s['name']}'" + (f": {cmd}" if cmd else " (shell only).")
+
+
+def stop(s_name):
+    if not has_session(s_name):
+        return f"'{s_name}' isn't running."
+    tmux("kill-session", "-t", f"={s_name}")
+    return f"Stopped '{s_name}'."
+
+
+def open_in_terminal(cfg, name):
+    if not has_session(name):
+        raise TendError(f"'{name}' isn't running.")
+    attach = f"{shutil.which('tmux')} attach -t ={shlex.quote(name)}"
+    if cfg.get("terminal", "").lower().startswith("iterm"):
+        script = (
+            'tell application "iTerm"\n'
+            "  activate\n"
+            f"  create window with default profile command {json.dumps(attach)}\n"
+            "end tell"
+        )
+    else:
+        script = (
+            'tell application "Terminal"\n'
+            "  activate\n"
+            f"  do script {json.dumps(attach)}\n"
+            "end tell"
+        )
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode:
+        raise TendError(r.stderr.strip())
+
+
+def adopt(cfg, name, rows=None):
+    """Track a running tmux session, copying its directory and command."""
+    rows = rows if rows is not None else status(cfg, sync=False)
+    row = next((r for r in rows if r["name"] == name), None)
+    if not row:
+        raise TendError(f"no tmux session named '{name}'.")
+    if row["managed"]:
+        return None
+    s = {"name": name, "dir": row["dir"], "command": row["command"], "autostart": True}
+    if row["resume"]:
+        s["resume"] = row["resume"]
+    cfg["services"].append(s)
+    return s
+
+
+# ---------------------------------------------------------------- CLI
+
+
+def apps_command(cfg, a):
+    custom = cfg.setdefault("apps", [])
+    by_id = {x["id"]: x for x in apps(cfg)}
+
+    if a.action == "ls":
+        rows = list(by_id.values())
+        if a.json:
+            json.dump(rows, sys.stdout, indent=2)
+            print()
+            return
+        for x in rows:
+            m = x.get("match", {})
+            rules = ", ".join(m.get("names", []) + m.get("paths", []))
+            flags = ("" if x["enabled"] else " (off)") + (" (built in)" if x["builtin"] else "")
+            print(f"{x['id']:<12} {x.get('name', x['id'])}{flags}: {rules}")
+        return
+
+    if not a.target:
+        raise TendError(f"`tend apps {a.action}` needs an app ID or program.")
+
+    if a.action == "add":
+        target = a.target
+        path = shutil.which(target) if "/" not in target else os.path.expanduser(target)
+        if not path or not os.path.exists(path):
+            raise TendError(f"can't find a program named '{target}'.")
+        real = os.path.realpath(path)
+        app_id = a.id or re.sub(r"[^a-z0-9-]+", "-", Path(target).name.lower()).strip("-")
+        if app_id in by_id:
+            raise TendError(f"there's already an app with ID '{app_id}'. Pick another with --id.")
+        names = sorted({Path(path).name, Path(real).name})
+        custom.append(
+            {
+                "id": app_id,
+                "name": a.name or Path(path).name,
+                "match": {"names": names, "paths": [real]},
+            }
+        )
+        save(cfg)
+        print(f"Added '{app_id}'. It matches processes named {', '.join(names)}, or running {real}.")
+        return
+
+    if a.target not in by_id:
+        raise TendError(f"no app with ID '{a.target}'. Run `tend apps` to see them.")
+
+    if a.action == "rm":
+        if by_id[a.target]["builtin"]:
+            raise TendError(f"'{a.target}' is built in. Turn it off with `tend apps disable {a.target}`.")
+        cfg["apps"] = [x for x in custom if x["id"] != a.target]
+        save(cfg)
+        print(f"Removed '{a.target}'.")
+        return
+
+    entry = next((x for x in custom if x["id"] == a.target), None)
+    if entry is None:
+        entry = {"id": a.target}
+        custom.append(entry)
+    entry["enabled"] = a.action == "enable"
+    save(cfg)
+    print(f"'{a.target}' is {'on' if entry['enabled'] else 'off'}.")
+
+
+
+def print_table(rows):
+    if not rows:
+        print("No services and no tmux sessions. Track one with `tend add`.")
+        return
+    home = str(HOME)
+    table = [("NAME", "STATE", "APP", "AUTO", "DIR", "COMMAND")]
+    for r in rows:
+        c = r["app"]
+        table.append(
+            (
+                r["name"] + ("" if r["managed"] else " *"),
+                r["state"] + (" (attached)" if r["attached"] else ""),
+                f"{c['name']} {c['status'] or ''}".strip() if c else "-",
+                ("yes" if r["autostart"] else "no") if r["managed"] else "-",
+                r["dir"].replace(home, "~", 1),
+                r["command"] or "(shell)",
+            )
+        )
+    widths = [max(len(row[i]) for row in table) for i in range(5)]
+    for row in table:
+        print("  ".join(v.ljust(w) for v, w in zip(row[:5], widths)) + "  " + row[5])
+    if any(not r["managed"] for r in rows):
+        print("\n* not tracked. Run `tend snapshot` to track every running session.")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="tend", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("ls", aliases=["status"])
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("add")
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--dir", default=os.getcwd())
+    sp.add_argument("--no-autostart", action="store_true")
+    sp.add_argument("--start", action="store_true")
+
+    sp = sub.add_parser("new")
+    sp.add_argument("app", nargs="?")
+    sp.add_argument("--dir", default=os.getcwd())
+    sp.add_argument("--name")
+    sp.add_argument("--no-autostart", action="store_true")
+    sp.add_argument("--command", help="a shell command, typed into the session as is")
+
+    sp = sub.add_parser("snapshot")
+    sp.add_argument("names", nargs="*")
+
+    sp = sub.add_parser("rm")
+    sp.add_argument("name")
+    sp.add_argument("--stop", action="store_true")
+
+    for c in ("start", "restart"):
+        sp = sub.add_parser(c)
+        sp.add_argument("name")
+        sp.add_argument("--fresh", action="store_true", help="ignore the saved Claude session")
+
+    for c in ("stop", "attach", "open"):
+        sub.add_parser(c).add_argument("name")
+
+    sub.add_parser("restore")
+
+    sp = sub.add_parser("apps", help="list or change the apps tend recognizes")
+    sp.add_argument("action", nargs="?", choices=["ls", "add", "rm", "enable", "disable"], default="ls")
+    sp.add_argument("target", nargs="?", help="an app ID, or for add, a program name or path")
+    sp.add_argument("--id")
+    sp.add_argument("--name")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("autostart")
+    sp.add_argument("name")
+    sp.add_argument("value", choices=["on", "off"])
+
+    args = sys.argv[1:]
+    command = []
+    if "--" in args:
+        i = args.index("--")
+        args, command = args[:i], args[i + 1 :]
+    a = p.parse_args(args)
+    cfg = load()
+
+    if a.cmd in ("ls", "status"):
+        rows = status(cfg)
+        if a.json:
+            json.dump(rows, sys.stdout, indent=2)
+            print()
+        else:
+            print_table(rows)
+
+    elif a.cmd == "new":
+        d = str(Path(a.dir).expanduser().resolve())
+        if not Path(d).is_dir():
+            raise TendError(f"{d} isn't a directory.")
+        app = None
+        if a.app:
+            app = next((x for x in apps(cfg) if x["id"] == a.app), None)
+            if not app:
+                raise TendError(f"no app with ID '{a.app}'. Run `tend apps` to see them.")
+        cmd = a.command or (shlex.join(command) if command else (app or {}).get("launch"))
+        if app and not cmd:
+            raise TendError(f"'{app['id']}' has no launch command. Give one after --.")
+        if app and app.get("preflight"):
+            preflight(app["preflight"], d)
+        name = unique_name(cfg, session_name(a.name or Path(d).name))
+        s = {"name": name, "dir": d, "command": cmd, "autostart": not a.no_autostart}
+        cfg["services"].append(s)
+        save(cfg)
+        print(start(cfg, s))
+
+    elif a.cmd == "add":
+        d = str(Path(a.dir).expanduser().resolve())
+        name = session_name(a.name or Path(d).name)
+        if find(cfg, name):
+            raise TendError(f"'{name}' is already tracked. Remove it first with `tend rm {name}`.")
+        if not command and has_session(name):
+            adopt(cfg, name)
+        else:
+            cfg["services"].append(
+                {
+                    "name": name,
+                    "dir": d,
+                    "command": shlex.join(command) if command else None,
+                    "autostart": not a.no_autostart,
+                }
+            )
+        save(cfg)
+        print(f"Tracking '{name}'.")
+        if a.start:
+            print(start(cfg, need(cfg, name)))
+
+    elif a.cmd == "snapshot":
+        rows = status(cfg, sync=False)
+        names = a.names or [r["name"] for r in rows if not r["managed"]]
+        added = [s for n in names if (s := adopt(cfg, n, rows))]
+        save(cfg)
+        for s in added:
+            print(f"Tracking '{s['name']}': {s.get('resume') or s['command'] or '(shell)'}")
+        if not added:
+            print("Every running session is already tracked.")
+
+    elif a.cmd == "rm":
+        need(cfg, a.name)
+        if a.stop:
+            print(stop(a.name))
+        cfg["services"] = [s for s in cfg["services"] if s["name"] != a.name]
+        save(cfg)
+        print(f"Stopped tracking '{a.name}'.")
+
+    elif a.cmd == "start":
+        print(start(cfg, need(cfg, a.name), a.fresh))
+
+    elif a.cmd == "stop":
+        print(stop(a.name))
+
+    elif a.cmd == "restart":
+        s = need(cfg, a.name)
+        status(cfg)  # record the latest Claude session before stopping
+        print(stop(a.name))
+        print(start(cfg, s, a.fresh))
+
+    elif a.cmd == "restore":
+        todo = [s for s in cfg["services"] if s.get("autostart", True) and not has_session(s["name"])]
+        for s in todo:
+            try:
+                print(start(cfg, s))
+            except TendError as e:
+                print(f"tend: couldn't start '{s['name']}': {e}", file=sys.stderr)
+        if not todo:
+            print("Every autostart service is running.")
+
+    elif a.cmd == "apps":
+        apps_command(cfg, a)
+
+    elif a.cmd == "autostart":
+        need(cfg, a.name)["autostart"] = a.value == "on"
+        save(cfg)
+        print(f"Autostart for '{a.name}' is {a.value}.")
+
+    elif a.cmd == "attach":
+        if not has_session(a.name):
+            raise TendError(f"'{a.name}' isn't running.")
+        verb = "switch-client" if os.environ.get("TMUX") else "attach"
+        os.execvp("tmux", ["tmux", verb, "-t", f"={a.name}"])
+
+    elif a.cmd == "open":
+        open_in_terminal(cfg, a.name)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except TendError as e:
+        print(f"tend: {e}", file=sys.stderr)
+        sys.exit(1)
