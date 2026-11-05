@@ -1,6 +1,7 @@
 ---
 name: tend
 description: Start or manage long-running Claude Code sessions with the `tend` CLI. Use when the user wants a new session in a project folder (existing or new), or wants to list, open, stop, or restart the sessions tend keeps alive.
+argument-hint: "[help | new [FOLDER] | ls | open NAME | stop NAME | restart NAME]"
 ---
 
 # Tend sessions
@@ -9,6 +10,30 @@ description: Start or manage long-running Claude Code sessions with the `tend` C
 and comes back after a restart. A session is a folder plus a command, usually
 Claude Code's Remote Control (`claude remote-control`). For every command and
 flag, run `tend --help`.
+
+Route by the request. With arguments, the first word picks the branch: `new`
+starts a session, `help` shows the menu, and any other `tend` command (`ls`,
+`open`, `stop`, `restart`, `start`, `snapshot`, `autostart`, `rm`) runs under
+**Manage sessions**. With no arguments and no request, or when the user asks
+what this can do, show the menu.
+
+## Menu
+
+Show this, then ask what they'd like to do:
+
+> **Tend keeps Claude Code sessions running in tmux, and brings them back
+> after a restart.** Ask in your own words, or use a command:
+>
+> | Command | What it does |
+> |---|---|
+> | `/tend new [FOLDER]` | Start a Claude session in a project folder, or in a new folder |
+> | `/tend ls` | List your sessions, and whether each Claude is busy or idle |
+> | `/tend open NAME` | Open a session in a terminal window |
+> | `/tend stop NAME`, `/tend restart NAME` | Stop or restart a session (asks you first) |
+> | `/tend help` | Show this menu |
+>
+> For example: "start a session in a new folder called recipe-box", "which
+> sessions are busy?", or "restart recipe-box with a fresh conversation".
 
 ## Start a new session
 
