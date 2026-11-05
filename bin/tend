@@ -315,7 +315,8 @@ def exe_path(pid, _cache={}):
 #     paths        Glob patterns, compared with the real executable path.
 #   modes        Optional. The first mode whose `args` contains argv[1]
 #                wins; a mode without `args` matches anything. A mode can set
-#                `resume`, a command template filled in from the metadata.
+#                `resume`, a command template filled in from the metadata,
+#                plus {command}: the running command without strip_flags.
 #   strip_flags  Optional. Flags to drop from the saved command, mapped to
 #                how many values follow them, so a fresh start stays fresh.
 #   launch       Optional. The command `tend new` runs to start a new
@@ -341,7 +342,12 @@ BUILTIN_APPS = [
             {
                 "id": "remote-control",
                 "args": ["rc", "remote-control"],
-                "resume": "claude remote-control --session-id {bridgeSessionId}",
+                # Restart the same command. Remote Control keeps its
+                # environment, so a plain restart reconnects the last
+                # conversation and stays in server mode, where the app can
+                # start new sessions. --session-id and --continue reconnect
+                # in single-session mode, which turns that off.
+                "resume": "{command}",
             },
             {"id": "interactive", "resume": "claude --resume {sessionId}"},
         ],
@@ -416,13 +422,6 @@ def describe(app, proc, pids, metadata):
     )
     m = meta[0] if meta else {}
 
-    resume = None
-    if mode.get("resume") and m:
-        try:
-            resume = mode["resume"].format_map(m)
-        except (KeyError, IndexError, ValueError):
-            pass
-
     # Drop resume flags, so the saved command always starts fresh.
     strip = app.get("strip_flags", {})
     base, skip = a[:1], 0
@@ -433,6 +432,13 @@ def describe(app, proc, pids, metadata):
             skip = strip[arg]
         elif not any(arg.startswith(f + "=") for f in strip if f.startswith("--")):
             base.append(arg)
+
+    resume = None
+    if mode.get("resume") and m:
+        try:
+            resume = mode["resume"].format_map({**m, "command": shlex.join(base)})
+        except (KeyError, IndexError, ValueError):
+            pass
     return {
         "id": app["id"],
         "name": app.get("name", app["id"]),

@@ -109,8 +109,13 @@ deliberate.
 
 ### Claude specifics
 
-- Remote Control resume: `claude remote-control --session-id {bridgeSessionId}`.
-  `--continue` only works for about 4 hours, so it can't survive a night.
+- Remote Control resume: the same command, like `claude rc`. When Remote
+  Control stops, it keeps its environment, and a plain restart reconnects the
+  last conversation in server mode, where the Claude app's plus button starts
+  new sessions in that folder. Tend used `--session-id {bridgeSessionId}`
+  before, and `--continue` is the other option. Both reconnect in
+  single-session mode, which grays out the plus button, and `--continue` only
+  works for about 4 hours.
 - Interactive resume: `claude --resume {sessionId}`.
 - `strip_flags` removes `--continue`, `--session-id`, and `--resume` from the
   saved `command`, so **Start fresh** really is fresh.
@@ -157,10 +162,11 @@ in `bin/tend`.
 
 Untested, in rough order of risk:
 
-1. **Restoring a real Claude session** with `--session-id <bridgeSessionId>`.
-   The ID format (`session_01…`, compared with the `cse_01…` in the process
-   arguments) isn't confirmed. If a restore fails, the error stays in the
-   tmux shell, and **Start fresh** works around it.
+1. **How long Remote Control keeps its environment.** A plain `claude rc`
+   restart reconnected the last conversation a minute later. Whether it still
+   does after a night, or after a reboot, isn't confirmed. If the environment
+   has expired, the restart starts a new conversation, and the old one stays
+   in the app's history.
 2. **The plus button** starting a real `claude rc` session.
 3. **The app's UI** hasn't been seen by an agent: the panel, the Apps section,
    the new-session form, and the folder pickers (`NSOpenPanel` from a menu bar
