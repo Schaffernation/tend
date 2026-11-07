@@ -216,10 +216,27 @@ Untested, in rough order of risk:
 2. **The plus button** starting a real `claude rc` session.
 3. **The app's UI** hasn't been seen by an agent: the panel, the Apps section,
    the new-session form, and the folder pickers (`NSOpenPanel` from a menu bar
-   panel can appear behind other windows).
-4. **Open in terminal** (iTerm through AppleScript). The first use will
-   probably ask for Automation permission.
+   panel can appear behind other windows). Also unseen: app icons on rows,
+   the Trust and Don't trust buttons, and the Setup picker.
+4. **Open in terminal** (iTerm through AppleScript) from inside a tend
+   session fails with "Not authorized to send Apple events to iTerm
+   (-1743)". The tmux server is started by the `com.example.tmux-server` launch
+   agent, so macOS sees `/opt/homebrew/bin/tmux`, a background program, as
+   the sender. It can't show an Allow prompt for that, so it denies, and
+   `tccutil reset` doesn't help. `tend open` works from an iTerm window and
+   from the app. A fix: when `tend open` runs inside tmux, hand the request
+   to Tend.app, which has the permission.
 5. **Open at login** through `SMAppService` with an ad hoc signed app.
+6. **A renamed folder strands its session.** When `~/Projects/app`
+   was renamed to `app-ios`, the session kept running (processes follow
+   the rename), but its tracked `dir` pointed at a folder that no longer
+   existed, so a restart or restore would fail. `tend ls` could flag a
+   tracked `dir` that's missing.
+7. **Remote Control entries outlive their process.** After a test
+   `claude rc` stops, its environment stays in the Claude app and at
+   claude.ai/code as disconnected for a while, and `claude rc` has no command
+   to remove it. A session stopped minutes earlier can still show as
+   connected until the app catches up.
 
 Ideas raised but not built:
 

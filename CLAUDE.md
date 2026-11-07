@@ -59,5 +59,14 @@ what's untested).
 - The running app polls its bundled `tend ls`, which saves resume commands.
   After you change how `bin/tend` computes them, rebuild the app, or its old
   copy writes the old commands back within 5 seconds.
+- `tend open` fails from this conversation, with "Not authorized to send
+  Apple events" (-1743), because the tmux server runs under launchd and macOS
+  can't ask for permission for it. Don't reset Automation permissions with
+  `tccutil`. Ask the user to run it in iTerm, or to use the app.
+- A real `claude rc` test leaves a disconnected entry in the user's Claude app,
+  and answering its trust prompt adds the folder to `~/.claude.json`. To test
+  `questions` and `tend answer`, use a fake `claude` script on a scratch tmux
+  server instead: `printf 'Trust %s? [y/N] ' "$PWD"; read a`. tend matches
+  it by the script's name.
 - `tend ls` saves resume commands as a side effect. Use `status(cfg, sync=False)`
   when you need a read-only scan.
