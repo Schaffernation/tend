@@ -161,6 +161,14 @@ deliberate.
   Claude's, and running Claude processes rewrite it often. `tend answer`
   checks that the question is still on screen before it types, so it never
   types `y` into a shell.
+- **`tend wait` decides when a new session is ready.** The trust question
+  can be answered in the menu or by the skill in chat, and the first answer
+  wins, so the skill waits for the session's state instead of trusting its
+  own answer. For Claude, "ready" means the session file reports a status:
+  in a real test, that came about 35 seconds after answering trust, while
+  the pane already said "Connected". An app with no status field is ready
+  once its command runs. `wait` allows 10 seconds for the shell to start
+  the command before it believes "exited".
 - **Setup runs once, outside the session.** `tend new --setup CMD` (or
   `--recipe ID --input TEXT`) runs in the folder before tend tracks the
   session, with the login shell's environment, so a failed clone shows its

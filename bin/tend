@@ -32,6 +32,10 @@ Usage:
   tend recipes rm ID               Remove a setup you saved.
   tend answer NAME ANSWER          Answer the question a session is waiting
                                    on, like Claude's trust prompt (yes or no).
+  tend wait NAME [--timeout S]     Wait until a session is ready (for Claude,
+                                   connected), is waiting on a question, or
+                                   has exited. Exit status: 0 ready, 1 exited,
+                                   2 question, 3 timed out.
   tend add [NAME] [--dir D] [--no-autostart] [--start] [-- COMMAND...]
                                    Track a service. With no command, tend
                                    copies the command from a running session.
@@ -808,6 +812,38 @@ def recipes_command(cfg, a):
     print(f"Removed recipe '{a.target}'.")
 
 
+def wait(cfg, name, timeout):
+    """Wait for a session to settle. Return (exit status, message)."""
+    began = time.monotonic()
+    deadline = began + timeout
+    seen_running = False
+    while True:
+        row = next((r for r in status(cfg, sync=False) if r["name"] == name), None)
+        if not row:
+            raise TendError(f"no session named '{name}'.")
+        c = row["app"]
+        seen_running = seen_running or row["state"] == "running"
+        # Right after a start, the shell may not have run the command yet.
+        if row["state"] == "exited" and not seen_running and time.monotonic() - began < 10:
+            time.sleep(1)
+            continue
+        if row["state"] != "running":
+            return 1, f"'{name}' isn't running: its command {'exited' if row['state'] == 'exited' else 'stopped'}."
+        if c and c.get("question"):
+            q = c["question"]
+            ids = "|".join(x["id"] for x in q["answers"])
+            return 2, f"'{name}' is waiting: {q['text']}\nAnswer with `tend answer {name} {ids}`."
+        app = c and next((x for x in apps(cfg) if x["id"] == c["id"]), None)
+        # An app that reports a status is ready once it does; any other
+        # running command is ready now.
+        if not (app and app.get("metadata", {}).get("status_field")) or c["status"]:
+            what = f"{c['name']} is {c['status']}" if c and c["status"] else "it's running"
+            return 0, f"'{name}' is ready: {what}."
+        if time.monotonic() >= deadline:
+            return 3, f"'{name}' is still starting after {timeout} seconds. Check it with `tend open {name}`."
+        time.sleep(2)
+
+
 def answer(cfg, name, answer_id):
     """Type the answer to the question a session is waiting on."""
     row = next((r for r in status(cfg, sync=False) if r["name"] == name), None)
@@ -1251,6 +1287,10 @@ def main():
     sp.add_argument("--input", help="for add: a label for the text {input} stands for")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("wait", help="wait until a session is ready, asks a question, or exits")
+    sp.add_argument("name")
+    sp.add_argument("--timeout", type=int, default=90, help="seconds to wait (default 90)")
+
     sp = sub.add_parser("answer", help="answer the question a session is waiting on")
     sp.add_argument("name")
     sp.add_argument("answer")
@@ -1477,6 +1517,11 @@ def main():
 
     elif a.cmd == "answer":
         print(answer(cfg, a.name, a.answer))
+
+    elif a.cmd == "wait":
+        code, message = wait(cfg, a.name, a.timeout)
+        print(message)
+        sys.exit(code)
 
     elif a.cmd == "folders":
         f = folders(cfg)

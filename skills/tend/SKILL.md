@@ -71,15 +71,26 @@ Show this, then ask what they'd like to do:
    command, drop the app and put the command after `--`. The step is done
    when the output says `Started 'NAME'`. If it fails, show the user tend's
    error, which says what to fix.
-   If tend says Claude will ask whether to trust the folder, ask the user
-   with AskUserQuestion: "Trust FOLDER?", with the options **Trust** and
-   **Don't trust**. Say that trusting lets the folder's project settings
-   (hooks, MCP servers, permission rules) apply to its sessions. Run
-   `tend answer NAME yes` for Trust (it types `y`, then Enter), or
-   `tend answer NAME no`. The session waits, out of sight, until then.
-7. **Report** the session name and folder, and how to reach it:
+7. **Wait for it to settle.** Run `tend wait NAME`. It returns when the
+   session is ready, is waiting on a question, or has exited, and its exit
+   status says which:
+   - **0, ready.** For Claude, Remote Control has connected. Go to step 8.
+   - **2, waiting on a question,** like "Trust FOLDER?". The same question
+     also has buttons in the Tend menu, and the first answer wins. Ask the
+     user with AskUserQuestion, using the answers tend lists: for trust,
+     **Trust** and **Don't trust**. Say that trusting lets the folder's
+     project settings (hooks, MCP servers, permission rules) apply to its
+     sessions. Then run `tend answer NAME yes` (or `no`). If it says the
+     session `isn't waiting on a question`, the user already answered in
+     the menu. That's fine; don't treat it as an error. Either way, run
+     `tend wait NAME` again.
+   - **1, exited.** The command stopped, for example because the user
+     didn't trust the folder. Say so, and offer `tend open NAME` to see why.
+   - **3, timed out.** Say it's still starting, and offer `tend open NAME`.
+   Report a session as ready only after `tend wait` returns 0.
+8. **Report** the session name and folder, and how to reach it:
    - A Claude Remote Control session appears in the Claude app and at
-     claude.ai/code within a few seconds.
+     claude.ai/code.
    - `tend open NAME` opens it in a new terminal window. Offer to run it.
 
 ## Manage sessions
@@ -88,7 +99,8 @@ Show this, then ask what they'd like to do:
   with each one's state and, for Claude, whether it's `busy` or `idle`. Use
   `tend ls --json` when you need fields.
 - When `tend ls` says a session is waiting on a question (like Claude's
-  trust prompt), ask the user, then run `tend answer NAME ANSWER`.
+  trust prompt), ask the user, then run `tend answer NAME ANSWER`, and
+  `tend wait NAME` to confirm it carried on.
 - `tend open NAME` opens a session in a terminal window. `tend start NAME`
   starts a tracked session that's stopped.
 - `tend snapshot [NAME]` tracks running tmux sessions, so tend restores them.
