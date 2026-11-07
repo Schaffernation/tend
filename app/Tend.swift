@@ -13,9 +13,71 @@ import UserNotifications
 
 /// The app tend recognized in a session.
 struct AppInfo: Decodable, Hashable {
+    /// A prompt the app stopped on, like Claude asking to trust a folder.
+    struct Question: Decodable, Hashable {
+        struct Answer: Decodable, Hashable {
+            let id: String
+            let label: String
+        }
+        let id: String
+        let text: String
+        let answers: [Answer]
+    }
     let id: String
     let name: String
+    let icon: String?
     let status: String?
+    let question: Question?
+}
+
+/// A saved setup that `tend new --recipe` runs in a new session's folder.
+struct Recipe: Decodable, Identifiable, Hashable {
+    let id: String
+    let name: String?
+    let setup: String
+    let input: String?
+    var title: String { name ?? id }
+    var needsInput: Bool { setup.contains("{input}") }
+}
+
+/// Pictures for apps, from a profile's `icon`: a bundle ID, or the path to a
+/// .app or an image file. Each is looked up once.
+@MainActor
+enum AppIcons {
+    private static var cache: [String: NSImage?] = [:]
+
+    static func image(_ spec: String?, size: CGFloat = 16) -> NSImage? {
+        guard let spec, !spec.isEmpty else { return nil }
+        let key = "\(spec)@\(size)"
+        if let hit = cache[key] { return hit }
+        let image = load(spec)?.copy() as? NSImage
+        image?.size = NSSize(width: size, height: size)
+        cache[key] = image
+        return image
+    }
+
+    private static func load(_ spec: String) -> NSImage? {
+        let path = (spec as NSString).expandingTildeInPath
+        if path.hasPrefix("/") {
+            guard FileManager.default.fileExists(atPath: path) else { return nil }
+            if path.hasSuffix(".app") { return NSWorkspace.shared.icon(forFile: path) }
+            return NSImage(contentsOfFile: path)
+        }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: spec) else { return nil }
+        return NSWorkspace.shared.icon(forFile: url.path)
+    }
+}
+
+/// An app's icon, or nothing if it has none or it can't be found.
+struct AppIconView: View {
+    let spec: String?
+    var size: CGFloat = 16
+
+    var body: some View {
+        if let image = AppIcons.image(spec, size: size) {
+            Image(nsImage: image).resizable().frame(width: size, height: size)
+        }
+    }
 }
 
 /// An app tend knows how to recognize.
@@ -30,6 +92,7 @@ struct AppProfile: Decodable, Identifiable, Hashable {
     let builtin: Bool
     let match: Match?
     let launch: String?
+    let icon: String?
     var title: String { name ?? id }
     var rules: String { ((match?.names ?? []) + (match?.paths ?? [])).joined(separator: ", ") }
 }
@@ -82,6 +145,7 @@ final class Model: ObservableObject {
     @Published var services: [Service] = []
     @Published var error: String?
     @Published var apps: [AppProfile] = []
+    @Published var recipes: [Recipe] = []
     @Published var terminal: TerminalSettings?
     @Published var accounts: Accounts?
 
@@ -103,6 +167,10 @@ final class Model: ObservableObject {
         var name = ""
         var command = ""
         var autostart = true
+        /// "" for no setup, "custom" for setupText as a command, or a recipe ID.
+        var setupID = ""
+        /// The custom setup command, or the recipe's input, like a URL.
+        var setupText = ""
     }
     @AppStorage("restoreOnLaunch") var restoreOnLaunch = true
 
@@ -154,6 +222,7 @@ final class Model: ObservableObject {
 
     var runningCount: Int { services.filter { $0.state == "running" }.count }
     var anyBusy: Bool { services.contains { $0.app?.status == "busy" } }
+    var anyQuestion: Bool { services.contains { $0.app?.question != nil } }
     var accountProblems: [AccountStatus] { accounts?.watched.filter { !$0.ok } ?? [] }
 
     @discardableResult
@@ -186,10 +255,12 @@ final class Model: ObservableObject {
     func refresh() async {
         guard let data = await run(["ls", "--json"]),
               let appData = await run(["apps", "--json"]),
-              let accountData = await run(["accounts", "--json"]) else { return }
+              let accountData = await run(["accounts", "--json"]),
+              let recipeData = await run(["recipes", "--json"]) else { return }
         do {
             services = try JSONDecoder().decode([Service].self, from: data)
             apps = try JSONDecoder().decode([AppProfile].self, from: appData)
+            recipes = try JSONDecoder().decode([Recipe].self, from: recipeData)
             let snake = JSONDecoder()
             snake.keyDecodingStrategy = .convertFromSnakeCase
             accounts = try snake.decode(Accounts.self, from: accountData)
@@ -279,6 +350,14 @@ final class Model: ObservableObject {
         if !d.autostart { args.append("--no-autostart") }
         let launch = apps.first { $0.id == d.appID }?.launch
         if d.command != launch { args += ["--command", d.command] }
+        let text = d.setupText.trimmingCharacters(in: .whitespaces)
+        switch d.setupID {
+        case "": break
+        case "custom": if !text.isEmpty { args += ["--setup", text] }
+        default:
+            args += ["--recipe", d.setupID]
+            if !text.isEmpty { args += ["--input", text] }
+        }
         Task {
             busy = true
             error = nil
@@ -312,6 +391,9 @@ struct TendApp: App {
             ContentView().environmentObject(model)
         } label: {
             Image(systemName: model.anyBusy ? "terminal.fill" : "terminal")
+            if model.anyQuestion {
+                Image(systemName: "questionmark.bubble")
+            }
             if !model.accountProblems.isEmpty {
                 Image(systemName: "person.crop.circle.badge.exclamationmark")
             }
@@ -477,7 +559,13 @@ struct NewSessionForm: View {
                 Text("New session").font(.subheadline).fontWeight(.medium)
 
                 Picker("App", selection: binding.appID) {
-                    ForEach(launchable) { Text($0.title).tag(Optional($0.id)) }
+                    ForEach(launchable) { app in
+                        if let image = AppIcons.image(app.icon) {
+                            Label { Text(app.title) } icon: { Image(nsImage: image) }.tag(Optional(app.id))
+                        } else {
+                            Text(app.title).tag(Optional(app.id))
+                        }
+                    }
                     Text("Other command").tag(String?.none)
                 }
                 .onChange(of: draft.appID) { _, id in
@@ -511,6 +599,19 @@ struct NewSessionForm: View {
                 TextField("Command", text: binding.command)
                     .font(.system(.body, design: .monospaced))
                     .help("The command Tend types into the new session's shell")
+
+                Picker("Setup", selection: binding.setupID) {
+                    Text("None").tag("")
+                    ForEach(model.recipes) { Text($0.title).tag($0.id) }
+                    Text("Custom command").tag("custom")
+                }
+                .onChange(of: draft.setupID) { _, _ in model.draft?.setupText = "" }
+                .help("Something to run once in the folder before the app starts, like cloning a repository. Restarts don't run it again.")
+                if let field = setupField {
+                    TextField(field.label, text: binding.setupText, prompt: Text(field.prompt))
+                        .font(.system(.body, design: .monospaced))
+                        .help(field.help)
+                }
                 Toggle("Restore at login", isOn: binding.autostart)
                     .help("Start this session again when Tend restores sessions")
 
@@ -519,10 +620,22 @@ struct NewSessionForm: View {
                     Button("Cancel") { model.draft = nil }
                     Button("Start") { model.create() }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(draft.dir.isEmpty || draft.command.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(draft.dir.isEmpty || draft.command.trimmingCharacters(in: .whitespaces).isEmpty
+                                  || (setupField != nil && draft.setupText.trimmingCharacters(in: .whitespaces).isEmpty))
                 }
             }
         }
+    }
+
+    /// The text field the chosen setup needs, if any.
+    var setupField: (label: String, prompt: String, help: String)? {
+        guard let id = model.draft?.setupID, !id.isEmpty else { return nil }
+        if id == "custom" {
+            return ("Setup", "git init", "A shell command Tend runs in the folder before the app starts")
+        }
+        guard let r = model.recipes.first(where: { $0.id == id }), r.needsInput else { return nil }
+        let label = r.input ?? "Input"
+        return (label, label, "Fills in {input} in: \(r.setup)")
     }
 
     func chooseFolder() {
@@ -530,6 +643,7 @@ struct NewSessionForm: View {
         panel.title = "Choose a folder for the new session"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.directoryURL = URL(fileURLWithPath: model.draft?.dir ?? NSHomeDirectory())
         NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK, let url = panel.url { model.draft?.dir = url.path }
@@ -568,14 +682,22 @@ struct ServiceRow: View {
                 .help(stateHint)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
+                    if let c = service.app, AppIcons.image(c.icon) != nil {
+                        AppIconView(spec: c.icon)
+                            .help("\(service.name) runs \(c.name)" + (c.status.map { ", which is \($0)." } ?? "."))
+                    }
                     Text(service.name).fontWeight(.medium)
                     if let c = service.app {
-                        Text([c.name, c.status].compactMap { $0 }.joined(separator: " "))
-                            .font(.caption2)
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(
-                                (c.status == "busy" ? Color.blue : Color.gray).opacity(0.2),
-                                in: Capsule())
+                        let named = AppIcons.image(c.icon) == nil
+                        let label = [named ? c.name : nil, c.status].compactMap { $0 }.joined(separator: " ")
+                        if !label.isEmpty {
+                            Text(label)
+                                .font(.caption2)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(
+                                    (c.status == "busy" ? Color.blue : Color.gray).opacity(0.2),
+                                    in: Capsule())
+                        }
                     }
                     if service.state == "exited" {
                         Text("exited").font(.caption2).foregroundStyle(.orange)
@@ -586,6 +708,17 @@ struct ServiceRow: View {
                 }
                 Text(subtitle).font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
+                if let q = service.app?.question {
+                    Text(q.text).font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        ForEach(q.answers, id: \.id) { a in
+                            Button(a.label) { model.act(["answer", service.name, a.id]) }
+                                .controlSize(.small)
+                                .help("Answer \(service.name)'s question: \(a.label)")
+                        }
+                    }
+                }
             }
             Spacer()
             buttons
@@ -650,10 +783,13 @@ struct AppsSection: View {
                         get: { app.enabled },
                         set: { model.act(["apps", $0 ? "enable" : "disable", app.id]) }
                     )) {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(app.title + (app.builtin ? " (built in)" : ""))
-                            Text(app.rules).font(.caption).foregroundStyle(.secondary)
-                                .lineLimit(1).truncationMode(.middle)
+                        HStack(spacing: 6) {
+                            AppIconView(spec: app.icon)
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(app.title + (app.builtin ? " (built in)" : ""))
+                                Text(app.rules).font(.caption).foregroundStyle(.secondary)
+                                    .lineLimit(1).truncationMode(.middle)
+                            }
                         }
                     }
                     .help("Recognize processes that match: \(app.rules)")
@@ -682,9 +818,13 @@ struct AppsSection: View {
         panel.directoryURL = URL(fileURLWithPath: "/opt/homebrew/bin")
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, var url = panel.url else { return }
-        // For a .app bundle, use its main executable.
-        if url.pathExtension == "app", let exe = Bundle(url: url)?.executableURL { url = exe }
-        model.act(["apps", "add", url.path])
+        // For a .app bundle, use its main executable, and its icon.
+        var icon: [String] = []
+        if url.pathExtension == "app", let bundle = Bundle(url: url), let exe = bundle.executableURL {
+            icon = ["--icon", bundle.bundleIdentifier ?? url.path]
+            url = exe
+        }
+        model.act(["apps", "add", url.path] + icon)
     }
 }
 

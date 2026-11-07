@@ -131,8 +131,14 @@ deliberate.
 - Interactive resume: `claude --resume {sessionId}`.
 - `strip_flags` removes `--continue`, `--session-id`, and `--resume` from the
   saved `command`, so **Start fresh** really is fresh.
-- `preflight: "claude-trust"` refuses to start Claude in a folder that isn't
-  trusted in `~/.claude.json`, because `claude rc` exits right away there.
+- Trust: in a folder that isn't trusted (itself or a parent, in
+  `~/.claude.json`), `claude rc` prints `Trust FOLDER? [y/N]` and waits.
+  `y` connects, and Claude records the trust itself. `n` exits with "is not
+  trusted". (Tested with 2.1.318. Older versions exited right away, which is
+  why `preflight: "claude-trust"` first refused to start there.) Now the
+  profile's `questions` entry recognizes the prompt, the app shows Trust and
+  Don't trust buttons on the row, and `tend answer NAME yes|no` types the
+  reply. The preflight only prints a note saying where to answer.
 
 ## Decisions and why
 
@@ -146,6 +152,26 @@ deliberate.
 - **Apps are data, not code.** Claude's support is a profile in the same
   format that users write. A new program's support should be a profile first,
   and code (like a `preflight` check) only when data can't express it.
+- **App icons come from installed apps, not favicons.** A profile's `icon` is
+  a bundle ID or a path, and the app asks macOS for that app's icon. This
+  works offline and matches what's in the Dock. Claude's profile uses the
+  Claude desktop app's icon, even though the program is Claude Code.
+- **Answer Claude's own trust prompt; don't write `~/.claude.json`.** Setting
+  `hasTrustDialogAccepted` ourselves would be simpler, but that file is
+  Claude's, and running Claude processes rewrite it often. `tend answer`
+  checks that the question is still on screen before it types, so it never
+  types `y` into a shell.
+- **Setup runs once, outside the session.** `tend new --setup CMD` (or
+  `--recipe ID --input TEXT`) runs in the folder before tend tracks the
+  session, with the login shell's environment, so a failed clone shows its
+  error in the form and starts nothing. It's never saved as the command, so
+  restarts don't repeat it. `claude rc` takes no starting prompt, so a recipe
+  that copies in a `CLAUDE.md` is the way to give new folders instructions.
+  Recipes are data (`recipes` in the config); `clone` is built in.
+- **Scripts match by their own name.** A script run by an interpreter (like
+  `sh tailscale-keepalive`) looks like `sh` to the process table, so matching
+  also checks the script's name and path. Without that, no profile could
+  recognize a shell script.
 - **`tend new --command STRING`** passes a raw shell string, because the app
   can't split a command into arguments safely.
 - **The app's new-session form lives in the model**, not view state, because

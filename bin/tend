@@ -17,10 +17,21 @@ Usage:
   tend folders [--json]            Suggest folders for a new session: recent
                                    ones, the ones next to them, and their
                                    parent folders.
-  tend new [APP] [--dir D] [--mkdir] [--name N] [--no-autostart] [-- COMMAND...]
+  tend new [APP] [--dir D] [--mkdir] [--name N] [--no-autostart]
+           [--setup CMD | --recipe ID [--input TEXT]] [-- COMMAND...]
                                    Track and start a new session. Runs the
                                    app's launch command (like `claude rc`), or
                                    COMMAND. Picks a free name from the folder.
+                                   --setup runs CMD in the folder once first,
+                                   like `git clone URL .`; --recipe runs a
+                                   saved setup, with TEXT for its {input}.
+  tend recipes [--json]            List saved setups for `tend new --recipe`.
+  tend recipes add ID --setup CMD [--name NAME] [--input LABEL]
+                                   Save a setup. {input} in CMD is replaced
+                                   with the --input you give `tend new`.
+  tend recipes rm ID               Remove a setup you saved.
+  tend answer NAME ANSWER          Answer the question a session is waiting
+                                   on, like Claude's trust prompt (yes or no).
   tend add [NAME] [--dir D] [--no-autostart] [--start] [-- COMMAND...]
                                    Track a service. With no command, tend
                                    copies the command from a running session.
@@ -46,8 +57,10 @@ Usage:
                                    warn when one isn't logged in or isn't
                                    running Tend.
   tend apps [--json]               List the apps tend recognizes (Claude is built in).
-  tend apps add PROGRAM [--id ID] [--name NAME]
+  tend apps add PROGRAM [--id ID] [--name NAME] [--icon ICON]
                                    Recognize another program, by name or path.
+                                   ICON is a bundle ID or a .app or image
+                                   path, for the menu bar app to show.
   tend apps enable|disable ID      Turn recognition of an app on or off.
   tend apps rm ID                  Remove an app you added.
   tend attach NAME                 Attach to the session in this terminal.
@@ -357,10 +370,15 @@ def exe_path(pid, _cache={}):
 # optionally, how to read its state and resume it. Fields:
 #
 #   id, name     Short ID and display name.
+#   icon         Optional. The picture the app shows for it: a bundle ID
+#                like "io.tailscale.ipn.macos", or the path to a .app or an
+#                image file.
 #   match        How to recognize the process. It matches if any rule does:
 #     names        Executable names, compared with argv[0] and the real
 #                  executable's file name.
 #     paths        Glob patterns, compared with the real executable path.
+#                For a script run by an interpreter (like `sh script`),
+#                both rules also compare the script's name and real path.
 #   modes        Optional. The first mode whose `args` contains argv[1]
 #                wins; a mode without `args` matches anything. A mode can set
 #                `resume`, a command template filled in from the metadata,
@@ -376,6 +394,15 @@ def exe_path(pid, _cache={}):
 #                that folder, so the old one can let go of it.
 #   preflight    Optional. A check tend runs before it starts the app in a
 #                folder. The only check so far is "claude-trust".
+#   questions    Optional. Prompts the app can stop and wait on. tend looks
+#                at the last line of the pane, and the menu bar app offers
+#                the answers as buttons. Each has:
+#     id           Short ID.
+#     match        A regular expression for the last non-empty line. Named
+#                  groups fill in {name} in `text`.
+#     text         The question to show.
+#     answers      [{id, label, keys}]: `tend answer NAME ID` types keys,
+#                  then Enter.
 #   metadata     Optional. JSON files the program writes about itself:
 #     glob         Files to read.
 #     pid_field    Field with the PID of a process in the session. tend
@@ -392,6 +419,7 @@ BUILTIN_APPS = [
     {
         "id": "claude",
         "name": "Claude",
+        "icon": "com.anthropic.claudefordesktop",
         "match": {"names": ["claude"], "paths": ["*/claude/versions/*"]},
         "modes": [
             {
@@ -413,6 +441,18 @@ BUILTIN_APPS = [
         "reattach": "claude remote-control --session-id {id}",
         "release_wait": {"args": ["--session-id", "-c", "--continue"], "seconds": 45},
         "preflight": "claude-trust",
+        "questions": [
+            {
+                # claude rc asks this in a folder you haven't trusted.
+                "id": "trust",
+                "match": r"^Trust (?P<folder>.+)\? \[y/N\]\s*$",
+                "text": "Trust {folder} in Claude Code? Sessions there can read, edit, and run files.",
+                "answers": [
+                    {"id": "yes", "label": "Trust", "keys": "y"},
+                    {"id": "no", "label": "Don't trust", "keys": "n"},
+                ],
+            }
+        ],
         "strip_flags": {"-c": 0, "--continue": 0, "--session-id": 1, "-r": 1, "--resume": 1},
         "metadata": {
             "glob": "~/.claude/sessions/*.json",
@@ -438,16 +478,32 @@ def apps(cfg):
     return out
 
 
+# Programs that run a script named by their first argument, like
+# `sh ~/.local/bin/tailscale-keepalive`.
+INTERPRETERS = {"zsh", "bash", "sh", "fish", "python", "python3", "node", "ruby", "perl"}
+
+
+def script_path(a):
+    """For `INTERPRETER SCRIPT ...`, return the script's real path."""
+    if len(a) < 2 or os.path.basename(a[0]).lstrip("-") not in INTERPRETERS:
+        return ""
+    if a[1].startswith("-") or not os.path.isfile(a[1]):
+        return ""
+    return os.path.realpath(a[1])
+
+
 def matches(app, proc):
     a = argv(proc["command"])
     m = app.get("match", {})
     exe = exe_path(proc["pid"])
     names = set(m.get("names", []))
+    paths = m.get("paths", [])
     if a and os.path.basename(a[0]).lstrip("-") in names:
         return True
-    if exe and os.path.basename(exe) in names:
-        return True
-    return bool(exe) and any(fnmatch.fnmatch(exe, g) for g in m.get("paths", []))
+    for path in (exe, script_path(a)):
+        if path and (os.path.basename(path) in names or any(fnmatch.fnmatch(path, g) for g in paths)):
+            return True
+    return False
 
 
 def read_metadata(app):
@@ -503,6 +559,7 @@ def describe(app, proc, pids, metadata):
     return {
         "id": app["id"],
         "name": app.get("name", app["id"]),
+        "icon": app.get("icon"),
         "mode": mode.get("id"),
         "command": shlex.join(base),
         "status": m.get(md.get("status_field", ""), None),
@@ -538,6 +595,8 @@ def inspect_session(name, panes, procs, children, app_list, metadata):
                 parent = procs.get(p["ppid"])
                 if matches(app, p) and not (parent and matches(app, parent)):
                     found = describe(app, p, set(pids), metadata.get(app["id"], []))
+                    found["pane"] = f"={name}:{pane['window']}.{pane['pane']}"
+                    found["question"] = pending_question(app, found["pane"])
                     break
             if found:
                 break
@@ -551,6 +610,26 @@ def inspect_session(name, panes, procs, children, app_list, metadata):
         "attached": any(p["attached"] for p in panes),
         "app": found,
     }
+
+
+def pending_question(app, target):
+    """Return the question the app is waiting on in a pane, or None."""
+    questions = app.get("questions")
+    if not questions:
+        return None
+    r = tmux("capture-pane", "-p", "-t", target, check=False)
+    lines = [l for l in r.stdout.splitlines() if l.strip()] if r.returncode == 0 else []
+    if not lines:
+        return None
+    for q in questions:
+        m = re.search(q["match"], lines[-1])
+        if m:
+            return {
+                "id": q["id"],
+                "text": q["text"].format_map({k: v or "" for k, v in m.groupdict().items()}),
+                "answers": [{"id": x["id"], "label": x["label"]} for x in q["answers"]],
+            }
+    return None
 
 
 def detected_command(info):
@@ -630,26 +709,122 @@ def status(cfg, sync=True):
 # ---------------------------------------------------------------- actions
 
 
-def preflight(check, d):
-    """Raise TendError if an app can't start in folder d."""
+def preflight(check, d, name):
+    """Return a note about starting an app in folder d, or None."""
     if check == "claude-trust":
-        # claude rc exits right away in a folder you haven't trusted.
-        # Trusting a parent folder counts too.
+        # claude rc asks whether to trust a new folder, and waits. In tmux
+        # nobody sees the question, so say where to answer it. Trusting a
+        # parent folder counts too.
         try:
             projects = json.loads((HOME / ".claude.json").read_text()).get("projects", {})
         except (OSError, json.JSONDecodeError):
-            return
+            return None
         p = d
         while True:
             if projects.get(p, {}).get("hasTrustDialogAccepted"):
-                return
+                return None
             if p == "/":
                 break
             p = os.path.dirname(p)
-        raise TendError(
-            f"you haven't trusted {d} in Claude Code yet. Run claude there once, "
-            "accept the trust prompt, and then try again."
+        return (
+            f"Claude will ask whether to trust {d}. Answer in the Tend menu, "
+            f"or run `tend answer {name} yes`."
         )
+    return None
+
+
+def run_setup(cmd, d):
+    """Run a setup command in folder d with your login shell's environment."""
+    print(f"Running setup: {cmd}", flush=True)
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    try:
+        r = subprocess.run([shell, "-lc", cmd], cwd=d, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        raise TendError(f"setup didn't finish in 15 minutes: {cmd}")
+    if r.returncode:
+        out = (r.stderr.strip() or r.stdout.strip()).splitlines()[-5:]
+        raise TendError(f"setup failed (exit {r.returncode}): {cmd}\n" + "\n".join(out))
+
+
+# Saved setups for `tend new --recipe`. Entries in the config's `recipes`
+# list override these by `id`, or add new ones.
+BUILTIN_RECIPES = [
+    {
+        "id": "clone",
+        "name": "Clone a Git repository",
+        "setup": "git clone {input} .",
+        "input": "Repository URL",
+    }
+]
+
+
+def recipes(cfg):
+    custom = {r["id"]: r for r in cfg.get("recipes", [])}
+    out = [{**b, **custom.pop(b["id"], {}), "builtin": True} for b in BUILTIN_RECIPES]
+    out.extend({**r, "builtin": False} for r in custom.values())
+    return out
+
+
+def recipe_command(cfg, rid, text):
+    r = next((x for x in recipes(cfg) if x["id"] == rid), None)
+    if not r:
+        raise TendError(f"no recipe with ID '{rid}'. Run `tend recipes` to see them.")
+    if "{input}" in r["setup"]:
+        if not text:
+            raise TendError(f"recipe '{rid}' needs --input ({r.get('input', 'text')}).")
+        return r["setup"].replace("{input}", shlex.quote(text))
+    return r["setup"]
+
+
+def recipes_command(cfg, a):
+    custom = cfg.setdefault("recipes", [])
+    by_id = {x["id"]: x for x in recipes(cfg)}
+    if a.action == "ls":
+        if a.json:
+            json.dump(list(by_id.values()), sys.stdout, indent=2)
+            print()
+            return
+        for x in by_id.values():
+            print(f"{x['id']:<12} {x.get('name', x['id'])}{' (built in)' if x['builtin'] else ''}: {x['setup']}")
+        return
+    if not a.target:
+        raise TendError(f"`tend recipes {a.action}` needs a recipe ID.")
+    if a.action == "add":
+        if not a.setup:
+            raise TendError("`tend recipes add` needs --setup.")
+        if a.target in by_id and by_id[a.target]["builtin"]:
+            raise TendError(f"'{a.target}' is built in. Pick another ID.")
+        entry = {"id": a.target, "name": a.name or a.target, "setup": a.setup}
+        if a.input:
+            entry["input"] = a.input
+        cfg["recipes"] = [x for x in custom if x["id"] != a.target] + [entry]
+        save(cfg)
+        print(f"Saved recipe '{a.target}'.")
+        return
+    if a.target not in by_id or by_id[a.target]["builtin"]:
+        raise TendError(f"no saved recipe with ID '{a.target}'.")
+    cfg["recipes"] = [x for x in custom if x["id"] != a.target]
+    save(cfg)
+    print(f"Removed recipe '{a.target}'.")
+
+
+def answer(cfg, name, answer_id):
+    """Type the answer to the question a session is waiting on."""
+    row = next((r for r in status(cfg, sync=False) if r["name"] == name), None)
+    if not row:
+        raise TendError(f"no session named '{name}'.")
+    q = row["app"] and row["app"].get("question")
+    if not q:
+        raise TendError(f"'{name}' isn't waiting on a question.")
+    app = next(x for x in apps(cfg) if x["id"] == row["app"]["id"])
+    spec = next(x for x in app["questions"] if x["id"] == q["id"])
+    choice = next((x for x in spec["answers"] if x["id"] == answer_id), None)
+    if not choice:
+        ids = " or ".join(x["id"] for x in spec["answers"])
+        raise TendError(f"answer with {ids}.")
+    tmux("send-keys", "-t", row["app"]["pane"], "-l", "--", choice["keys"])
+    tmux("send-keys", "-t", row["app"]["pane"], "Enter")
+    return f"Answered '{choice['label']}' in '{name}'."
 
 
 def unique_name(cfg, name):
@@ -838,13 +1013,14 @@ def apps_command(cfg, a):
         if app_id in by_id:
             raise TendError(f"there's already an app with ID '{app_id}'. Pick another with --id.")
         names = sorted({Path(path).name, Path(real).name})
-        custom.append(
-            {
-                "id": app_id,
-                "name": a.name or Path(path).name,
-                "match": {"names": names, "paths": [real]},
-            }
-        )
+        entry = {
+            "id": app_id,
+            "name": a.name or Path(path).name,
+            "match": {"names": names, "paths": [real]},
+        }
+        if a.icon:
+            entry["icon"] = os.path.expanduser(a.icon) if a.icon.startswith("~") else a.icon
+        custom.append(entry)
         save(cfg)
         print(f"Added '{app_id}'. It matches processes named {', '.join(names)}, or running {real}.")
         return
@@ -1036,6 +1212,11 @@ def print_table(rows):
         print("  ".join(v.ljust(w) for v, w in zip(row[:5], widths)) + "  " + row[5])
     if any(not r["managed"] for r in rows):
         print("\n* not tracked. Run `tend snapshot` to track every running session.")
+    for r in rows:
+        q = r["app"] and r["app"].get("question")
+        if q:
+            ids = "|".join(x["id"] for x in q["answers"])
+            print(f"\n{r['name']} is waiting: {q['text']}\n  Answer with `tend answer {r['name']} {ids}`.")
 
 
 def main():
@@ -1058,6 +1239,21 @@ def main():
     sp.add_argument("--no-autostart", action="store_true")
     sp.add_argument("--command", help="a shell command, typed into the session as is")
     sp.add_argument("--mkdir", action="store_true", help="create the folder if it doesn't exist")
+    sp.add_argument("--setup", help="a shell command to run in the folder once, before the app starts")
+    sp.add_argument("--recipe", help="a saved setup, from `tend recipes`")
+    sp.add_argument("--input", help="the text for the recipe's {input}, like a repository URL")
+
+    sp = sub.add_parser("recipes", help="list or change saved setups for `tend new`")
+    sp.add_argument("action", nargs="?", choices=["ls", "add", "rm"], default="ls")
+    sp.add_argument("target", nargs="?", help="a recipe ID")
+    sp.add_argument("--setup", help="for add: the shell command, with {input} for the text")
+    sp.add_argument("--name")
+    sp.add_argument("--input", help="for add: a label for the text {input} stands for")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("answer", help="answer the question a session is waiting on")
+    sp.add_argument("name")
+    sp.add_argument("answer")
 
     sp = sub.add_parser("folders", help="suggest folders for a new session")
     sp.add_argument("--json", action="store_true")
@@ -1097,6 +1293,7 @@ def main():
     sp.add_argument("target", nargs="?", help="an app ID, or for add, a program name or path")
     sp.add_argument("--id")
     sp.add_argument("--name")
+    sp.add_argument("--icon", help="for add: a bundle ID, or a .app or image path")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("terminal", help="show or change how `tend open` opens a session")
@@ -1140,9 +1337,12 @@ def main():
 
     elif a.cmd == "new":
         d = str(Path(a.dir).expanduser().resolve())
+        if a.setup and a.recipe:
+            raise TendError("give --setup or --recipe, not both.")
+        setup = a.setup or (a.recipe and recipe_command(cfg, a.recipe, a.input))
         if a.mkdir and not Path(d).exists():
             Path(d).mkdir(parents=True)
-            print(f"Created {d}.")
+            print(f"Created {d}.", flush=True)
         if not Path(d).is_dir():
             raise TendError(f"{d} isn't a directory.")
         app = None
@@ -1153,13 +1353,16 @@ def main():
         cmd = a.command or (shlex.join(command) if command else (app or {}).get("launch"))
         if app and not cmd:
             raise TendError(f"'{app['id']}' has no launch command. Give one after --.")
-        if app and app.get("preflight"):
-            preflight(app["preflight"], d)
         name = unique_name(cfg, session_name(a.name or Path(d).name))
+        if setup:
+            run_setup(setup, d)
+        note = app and app.get("preflight") and preflight(app["preflight"], d, name)
         s = {"name": name, "dir": d, "command": cmd, "autostart": not a.no_autostart}
         cfg["services"].append(s)
         save(cfg)
         print(start(cfg, s))
+        if note:
+            print(note)
 
     elif a.cmd == "add":
         d = str(Path(a.dir).expanduser().resolve())
@@ -1268,6 +1471,12 @@ def main():
 
     elif a.cmd == "apps":
         apps_command(cfg, a)
+
+    elif a.cmd == "recipes":
+        recipes_command(cfg, a)
+
+    elif a.cmd == "answer":
+        print(answer(cfg, a.name, a.answer))
 
     elif a.cmd == "folders":
         f = folders(cfg)

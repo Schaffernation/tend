@@ -54,12 +54,16 @@ Show this, then ask what they'd like to do:
    whether it exists.
 3. **For a new folder,** get its name from the user, and confirm the full
    path before you create anything.
-4. **Pick the app.** Use Claude unless the user asks for another app or gives
+4. **Set it up, if needed.** If the user names a repository to work on, add
+   `--recipe clone --input URL` (the folder must be new or empty). For any
+   other one-time step, like `git init`, add `--setup CMD`. `tend recipes`
+   lists saved setups. Setup runs once, before the app starts.
+5. **Pick the app.** Use Claude unless the user asks for another app or gives
    a command.
-5. **Start the session:**
+6. **Start the session:**
 
    ```
-   tend new claude --dir FOLDER [--mkdir] [--name NAME]
+   tend new claude --dir FOLDER [--mkdir] [--name NAME] [--recipe ID --input TEXT | --setup CMD]
    ```
 
    Add `--mkdir` for a new folder. Add `--name` only if the user chose a
@@ -67,7 +71,13 @@ Show this, then ask what they'd like to do:
    command, drop the app and put the command after `--`. The step is done
    when the output says `Started 'NAME'`. If it fails, show the user tend's
    error, which says what to fix.
-6. **Report** the session name and folder, and how to reach it:
+   If tend says Claude will ask whether to trust the folder, ask the user
+   with AskUserQuestion: "Trust FOLDER?", with the options **Trust** and
+   **Don't trust**. Say that trusting lets the folder's project settings
+   (hooks, MCP servers, permission rules) apply to its sessions. Run
+   `tend answer NAME yes` for Trust (it types `y`, then Enter), or
+   `tend answer NAME no`. The session waits, out of sight, until then.
+7. **Report** the session name and folder, and how to reach it:
    - A Claude Remote Control session appears in the Claude app and at
      claude.ai/code within a few seconds.
    - `tend open NAME` opens it in a new terminal window. Offer to run it.
@@ -77,6 +87,8 @@ Show this, then ask what they'd like to do:
 - `tend ls` lists tracked sessions and untracked tmux sessions (marked `*`),
   with each one's state and, for Claude, whether it's `busy` or `idle`. Use
   `tend ls --json` when you need fields.
+- When `tend ls` says a session is waiting on a question (like Claude's
+  trust prompt), ask the user, then run `tend answer NAME ANSWER`.
 - `tend open NAME` opens a session in a terminal window. `tend start NAME`
   starts a tracked session that's stopped.
 - `tend snapshot [NAME]` tracks running tmux sessions, so tend restores them.
