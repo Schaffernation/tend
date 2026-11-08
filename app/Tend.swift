@@ -143,7 +143,11 @@ struct Service: Decodable, Identifiable, Hashable {
 @MainActor
 final class Model: ObservableObject {
     @Published var services: [Service] = []
+    /// Why the last action failed, like a start or a new session. It stays
+    /// until you close it or take another action.
     @Published var error: String?
+    /// Why Tend can't read its sessions. It clears once a refresh works.
+    @Published var refreshError: String?
     @Published var apps: [AppProfile] = []
     @Published var recipes: [Recipe] = []
     @Published var terminal: TerminalSettings?
@@ -171,6 +175,8 @@ final class Model: ObservableObject {
         var setupID = ""
         /// The custom setup command, or the recipe's input, like a URL.
         var setupText = ""
+        /// Whether the form shows Name, Command, Setup, and Restore at login.
+        var showOptions = false
     }
     @AppStorage("restoreOnLaunch") var restoreOnLaunch = true
 
@@ -205,7 +211,7 @@ final class Model: ObservableObject {
 
     init() {
         if let problem = Model.setupProblem {
-            error = problem
+            refreshError = problem
             return
         }
         Task {
@@ -220,13 +226,23 @@ final class Model: ObservableObject {
         }
     }
 
+    var tracked: [Service] { services.filter(\.managed) }
+    var untracked: [Service] { services.filter { !$0.managed } }
     var runningCount: Int { services.filter { $0.state == "running" }.count }
+    /// Tracked sessions that `tend restore` would start.
+    var restorable: [Service] { tracked.filter { $0.autostart && $0.state == "stopped" } }
+    var waitingCount: Int { services.filter { $0.app?.question != nil }.count }
     var anyBusy: Bool { services.contains { $0.app?.status == "busy" } }
-    var anyQuestion: Bool { services.contains { $0.app?.question != nil } }
+    var anyQuestion: Bool { waitingCount > 0 }
     var accountProblems: [AccountStatus] { accounts?.watched.filter { !$0.ok } ?? [] }
 
-    @discardableResult
-    func run(_ args: [String]) async -> Data? {
+    var cliInstalled: Bool {
+        (try? FileManager.default.destinationOfSymbolicLink(atPath: Model.cliLink.path)) != nil
+            || FileManager.default.fileExists(atPath: Model.cliLink.path)
+    }
+
+    /// Run tend. Returns its output, or the error it printed.
+    func call(_ args: [String]) async -> (data: Data?, error: String?) {
         let result = await Task.detached { () -> (Int32, Data, String) in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: Model.tend)
@@ -246,28 +262,41 @@ final class Model: ObservableObject {
             return (p.terminationStatus, data, String(decoding: errData, as: UTF8.self))
         }.value
         if result.0 != 0 {
-            error = result.2.trimmingCharacters(in: .whitespacesAndNewlines)
-            return nil
+            return (nil, result.2.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        return result.1
+        return (result.1, nil)
+    }
+
+    /// Run tend for an action. If it fails, show its error until you close
+    /// it or take another action.
+    @discardableResult
+    func run(_ args: [String]) async -> Data? {
+        let result = await call(args)
+        if let message = result.error { error = message }
+        return result.data
     }
 
     func refresh() async {
-        guard let data = await run(["ls", "--json"]),
-              let appData = await run(["apps", "--json"]),
-              let accountData = await run(["accounts", "--json"]),
-              let recipeData = await run(["recipes", "--json"]) else { return }
+        var outputs: [Data] = []
+        for args in [["ls", "--json"], ["apps", "--json"], ["accounts", "--json"], ["recipes", "--json"]] {
+            let result = await call(args)
+            guard let data = result.data else {
+                refreshError = result.error
+                return
+            }
+            outputs.append(data)
+        }
         do {
-            services = try JSONDecoder().decode([Service].self, from: data)
-            apps = try JSONDecoder().decode([AppProfile].self, from: appData)
-            recipes = try JSONDecoder().decode([Recipe].self, from: recipeData)
+            services = try JSONDecoder().decode([Service].self, from: outputs[0])
+            apps = try JSONDecoder().decode([AppProfile].self, from: outputs[1])
             let snake = JSONDecoder()
             snake.keyDecodingStrategy = .convertFromSnakeCase
-            accounts = try snake.decode(Accounts.self, from: accountData)
+            accounts = try snake.decode(Accounts.self, from: outputs[2])
+            recipes = try JSONDecoder().decode([Recipe].self, from: outputs[3])
             checkAccounts()
-            error = nil
+            refreshError = nil
         } catch {
-            self.error = "Couldn't read tend's output: \(error.localizedDescription)"
+            refreshError = "Couldn't read tend's output: \(error.localizedDescription)"
         }
     }
 
@@ -380,6 +409,26 @@ final class Model: ObservableObject {
             busy = false
         }
     }
+
+    /// Start the new-session form with the app and folder you used last.
+    func newDraft() {
+        let defaults = UserDefaults.standard
+        let launchable = apps.filter { $0.enabled && $0.launch != nil }
+        let lastApp = defaults.string(forKey: "lastApp")
+        let app = launchable.first { $0.id == lastApp } ?? (lastApp == "" ? nil : launchable.first)
+        draft = Draft(
+            appID: app?.id,
+            dir: defaults.string(forKey: "lastDir")
+                ?? FileManager.default.homeDirectoryForCurrentUser.path,
+            command: app?.launch ?? "",
+            showOptions: app == nil)
+    }
+}
+
+/// A path with the home folder shown as ~.
+func shortPath(_ path: String) -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
 }
 
 @main
@@ -400,128 +449,197 @@ struct TendApp: App {
             if model.runningCount > 0 { Text("\(model.runningCount)") }
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView().environmentObject(model)
+        }
     }
 }
 
+// MARK: - Panel
+
+/// The menu bar panel: messages, the new-session form, and the sessions.
+/// Settings live in their own window.
 struct ContentView: View {
     @EnvironmentObject var model: Model
-    @State private var openAtLogin = SMAppService.mainApp.status == .enabled
+    @Environment(\.openSettings) private var openSettings
+    @State private var spins = 0.0
 
-    var tracked: [Service] { model.services.filter(\.managed) }
-    var untracked: [Service] { model.services.filter { !$0.managed } }
+    var summary: String {
+        var parts = [model.runningCount == 0 ? "Nothing running" : "\(model.runningCount) running"]
+        let stopped = model.tracked.filter { $0.state == "stopped" }.count
+        if stopped > 0 { parts.append("\(stopped) stopped") }
+        if model.waitingCount > 0 { parts.append("\(model.waitingCount) waiting for you") }
+        return parts.joined(separator: " · ")
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Tend").font(.headline)
-                Spacer()
-                if model.busy { ProgressView().controlSize(.small) }
-                Button { model.draft == nil ? newDraft() : (model.draft = nil) } label: {
-                    Image(systemName: model.draft == nil ? "plus" : "xmark")
+        VStack(alignment: .leading, spacing: 12) {
+            header
+            messages
+
+            if model.draft != nil { NewSessionForm() }
+
+            if model.services.isEmpty && model.draft == nil && model.refreshError == nil {
+                emptyState
+            }
+
+            if !model.tracked.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionHeader("Sessions") {
+                        if !model.restorable.isEmpty {
+                            Button("Restore \(model.restorable.count)") { model.act(["restore"]) }
+                                .help("Start the \(model.restorable.count == 1 ? "tracked session" : "\(model.restorable.count) tracked sessions") that \(model.restorable.count == 1 ? "is" : "are") set to restore and \(model.restorable.count == 1 ? "isn't" : "aren't") running: \(model.restorable.map(\.name).joined(separator: ", ")). Sessions that can resume, like Claude, reattach to their last conversation.")
+                        }
+                    }
+                    ForEach(model.tracked) { ServiceRow(service: $0) }
                 }
-                .buttonStyle(.borderless)
-                .help(model.draft == nil
-                      ? "Start a new session: pick an app and a folder."
-                      : "Cancel the new session.")
-                Button { model.act(["ls"]) } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless)
-                    .help("Check every session now, and save the latest session ID of apps that can resume, like Claude. Tend also does this every 5 seconds.")
             }
 
-            if let error = model.error {
-                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-            }
-
-            ForEach(model.accountProblems) { account in
-                Label(account.problem ?? "", systemImage: "person.crop.circle.badge.exclamationmark")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .help("To log \(account.name) in, choose their account from the user menu in the menu bar or Control Center. Their Tend then restarts their sessions.")
-            }
-
-            if model.services.isEmpty {
-                Text("No services. Start a tmux session, then choose Track running sessions.")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-
-            if model.draft != nil {
-                NewSessionForm()
-                Divider()
-            }
-
-            ForEach(tracked) { ServiceRow(service: $0) }
-
-            if !untracked.isEmpty {
-                Text("Not tracked").font(.caption).foregroundStyle(.secondary).padding(.top, 4)
-                ForEach(untracked) { ServiceRow(service: $0) }
+            if !model.untracked.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionHeader("Not tracked") {
+                        Button("Track all") { model.act(["snapshot"]) }
+                            .help("Add every untracked tmux session to the list, so Tend restores it.")
+                    }
+                    ForEach(model.untracked) { ServiceRow(service: $0) }
+                }
             }
 
             Divider()
-
-            HStack {
-                Button("Restore all") { model.act(["restore"]) }
-                    .help("Start every tracked session that's set to restore and isn't running. Sessions that can resume, like Claude, reattach to their last conversation.")
-                Button("Track running sessions") { model.act(["snapshot"]) }
-                    .disabled(untracked.isEmpty)
-                    .help(untracked.isEmpty
-                        ? "Every running tmux session is already tracked."
-                        : "Add every untracked tmux session to the list, so Tend restores it.")
-            }
-
-            AppsSection()
-            TerminalSection()
-            AccountsSection()
-
-            Toggle("Restore after the Mac starts", isOn: model.$restoreOnLaunch)
-                .help("The first time Tend opens after the Mac starts, start every tracked session that's set to restore. If you quit Tend or it crashes, your sessions keep running, and opening Tend again doesn't start or stop anything.")
-            Toggle("Open Tend at login", isOn: $openAtLogin)
-                .help("Open Tend when you log in. With the setting above, this restores your sessions after the Mac starts.")
-                .onChange(of: openAtLogin) { _, on in
-                    do {
-                        if on { try SMAppService.mainApp.register() }
-                        else { try SMAppService.mainApp.unregister() }
-                    } catch {
-                        model.error = "Couldn't change the login item: \(error.localizedDescription)"
-                        openAtLogin = SMAppService.mainApp.status == .enabled
-                    }
-                }
-
-            if Model.setupProblem == nil
-                && (try? FileManager.default.destinationOfSymbolicLink(atPath: Model.cliLink.path)) == nil
-                && !FileManager.default.fileExists(atPath: Model.cliLink.path) {
-                Button("Install command-line tool") { model.installCLI() }
-                    .help("Link tend into ~/.local/bin, so you can run it in a terminal and over ssh. Add ~/.local/bin to your PATH if it isn't there already.")
-            }
-
-            HStack {
-                Button("Edit config") {
-                    let url = FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent(".config/tend/services.json")
-                    NSWorkspace.shared.open(url)
-                }
-                .help("Open ~/.config/tend/services.json, the list of tracked sessions.")
-                Spacer()
-                Button("Quit Tend") { NSApp.terminate(nil) }
-                    .help("Quit the menu bar app. Your tmux sessions keep running.")
-            }
-
+            footer
         }
         .padding(12)
         .frame(width: 400)
     }
+
+    var header: some View {
+        HStack(spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Tend").font(.headline)
+                Text(summary).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            if model.busy { ProgressView().controlSize(.small) }
+            Button {
+                withAnimation(.easeInOut(duration: 0.6)) { spins += 1 }
+                model.act(["ls"])
+            } label: {
+                Image(systemName: "arrow.clockwise").rotationEffect(.degrees(spins * 360))
+            }
+            .buttonStyle(.borderless)
+            .keyboardShortcut("r")
+            .help("Check every session now, and save the latest session ID of apps that can resume, like Claude. Tend also does this every 5 seconds.")
+            Button { model.draft == nil ? model.newDraft() : (model.draft = nil) } label: {
+                Image(systemName: model.draft == nil ? "plus" : "xmark")
+            }
+            .buttonStyle(.borderless)
+            .keyboardShortcut("n")
+            .help(model.draft == nil
+                  ? "Start a new session: pick an app and a folder."
+                  : "Cancel the new session.")
+        }
+    }
+
+    @ViewBuilder var messages: some View {
+        let any = model.refreshError != nil || model.error != nil || !model.accountProblems.isEmpty
+        if any {
+            VStack(alignment: .leading, spacing: 6) {
+                if let problem = model.refreshError {
+                    Banner(text: problem, systemImage: "exclamationmark.triangle.fill", tint: .red,
+                           help: "Tend can't read its sessions. It tries again every 5 seconds.")
+                }
+                if let error = model.error {
+                    Banner(text: error, systemImage: "xmark.octagon.fill", tint: .red,
+                           help: "The last action failed.") { model.error = nil }
+                }
+                ForEach(model.accountProblems) { account in
+                    Banner(text: account.problem ?? "\(account.name) needs attention.",
+                           systemImage: "person.crop.circle.badge.exclamationmark", tint: .orange,
+                           help: "To log \(account.name) in, choose their account from the user menu in the menu bar or Control Center. Their Tend then restarts their sessions.")
+                }
+            }
+        }
+    }
+
+    var emptyState: some View {
+        VStack(spacing: 6) {
+            Text("No sessions yet").font(.callout).fontWeight(.medium)
+            Text("Start an app in a folder. Tend also lists tmux sessions you start yourself.")
+                .font(.caption).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("New session") { model.newDraft() }
+                .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+    }
+
+    var footer: some View {
+        HStack {
+            Button {
+                openSettings()
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Label("Settings…", systemImage: "gearshape")
+            }
+            .keyboardShortcut(",")
+            .help("The apps Tend recognizes, the terminal it opens sessions in, startup, and other accounts")
+            Spacer()
+            Button("Quit Tend") { NSApp.terminate(nil) }
+                .help("Quit the menu bar app. Your tmux sessions keep running.")
+        }
+        .buttonStyle(.borderless)
+    }
 }
 
-extension ContentView {
-    func newDraft() {
-        let defaults = UserDefaults.standard
-        let launchable = model.apps.filter { $0.enabled && $0.launch != nil }
-        let lastApp = defaults.string(forKey: "lastApp")
-        let app = launchable.first { $0.id == lastApp } ?? (lastApp == "" ? nil : launchable.first)
-        model.draft = Model.Draft(
-            appID: app?.id,
-            dir: defaults.string(forKey: "lastDir")
-                ?? FileManager.default.homeDirectoryForCurrentUser.path,
-            command: app?.launch ?? "")
+/// A message across the top of the panel, with an optional close button.
+struct Banner: View {
+    let text: String
+    let systemImage: String
+    let tint: Color
+    var help: String = ""
+    var onClose: (() -> Void)?
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: systemImage).foregroundStyle(tint)
+            Text(text)
+                .font(.callout)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let onClose {
+                Button(action: onClose) { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Close this message.")
+            }
+        }
+        .padding(8)
+        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .help(help)
+    }
+}
+
+/// A small heading over a group of rows, with room for a button.
+struct SectionHeader<Trailing: View>: View {
+    let title: String
+    let trailing: Trailing
+
+    init(_ title: String, @ViewBuilder trailing: () -> Trailing) {
+        self.title = title
+        self.trailing = trailing()
+    }
+
+    var body: some View {
+        HStack {
+            Text(title).font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
+            Spacer()
+            trailing.font(.caption).buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 6)
+        .padding(.bottom, 2)
     }
 }
 
@@ -529,6 +647,9 @@ extension ContentView {
 /// session and starts it, like rc-spawn but for any app.
 struct NewSessionForm: View {
     @EnvironmentObject var model: Model
+
+    /// The width of the form's label column, so the fields line up.
+    static let labelWidth: CGFloat = 64
 
     var launchable: [AppProfile] { model.apps.filter { $0.enabled && $0.launch != nil } }
 
@@ -548,74 +669,112 @@ struct NewSessionForm: View {
         return (recent, Array(nearby).sorted().prefix(40).map { $0 })
     }
 
-    func short(_ path: String) -> String {
-        path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
-    }
-
     var body: some View {
         if let draft = model.draft {
             let binding = Binding { model.draft ?? draft } set: { model.draft = $0 }
-            VStack(alignment: .leading, spacing: 8) {
-                Text("New session").font(.subheadline).fontWeight(.medium)
+            VStack(alignment: .leading, spacing: 10) {
+                Text("New session").font(.subheadline).fontWeight(.semibold)
 
-                Picker("App", selection: binding.appID) {
-                    ForEach(launchable) { app in
-                        if let image = AppIcons.image(app.icon) {
-                            Label { Text(app.title) } icon: { Image(nsImage: image) }.tag(Optional(app.id))
-                        } else {
-                            Text(app.title).tag(Optional(app.id))
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        label("App")
+                        Picker("App", selection: binding.appID) {
+                            ForEach(launchable) { app in
+                                if let image = AppIcons.image(app.icon) {
+                                    Label { Text(app.title) } icon: { Image(nsImage: image) }.tag(Optional(app.id))
+                                } else {
+                                    Text(app.title).tag(Optional(app.id))
+                                }
+                            }
+                            Text("Other command").tag(String?.none)
                         }
-                    }
-                    Text("Other command").tag(String?.none)
-                }
-                .onChange(of: draft.appID) { _, id in
-                    model.draft?.command = launchable.first { $0.id == id }?.launch ?? ""
-                }
-                .help("The app to run. Add apps, and their launch commands, in the Apps section.")
-
-                HStack {
-                    Text("Folder")
-                    Text(short(draft.dir)).lineLimit(1).truncationMode(.head)
-                        .foregroundStyle(.secondary)
+                        .labelsHidden()
+                        .fixedSize()
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Menu("Pick") {
-                        let s = suggestions
-                        Section("Recent") {
-                            ForEach(s.recent, id: \.self) { d in Button(short(d)) { model.draft?.dir = d } }
+                        .onChange(of: draft.appID) { _, id in
+                            model.draft?.command = launchable.first { $0.id == id }?.launch ?? ""
+                            if id == nil { model.draft?.showOptions = true }
                         }
-                        Section("Nearby") {
-                            ForEach(s.nearby, id: \.self) { d in Button(short(d)) { model.draft?.dir = d } }
-                        }
-                        Divider()
-                        Button("Choose…", action: chooseFolder)
+                        .help("The app to run. Add apps, and their launch commands, in Settings.")
                     }
-                    .fixedSize()
-                    .help("Recent folders, the folders next to them, or any folder")
-                }
 
-                TextField("Name", text: binding.name,
-                          prompt: Text((draft.dir as NSString).lastPathComponent))
-                    .help("The tmux session name. If you leave it empty, Tend uses the folder name, plus a number if that name is taken.")
-                TextField("Command", text: binding.command)
-                    .font(.system(.body, design: .monospaced))
-                    .help("The command Tend types into the new session's shell")
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        label("Folder")
+                        HStack {
+                            Text(shortPath(draft.dir)).lineLimit(1).truncationMode(.head)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .help(draft.dir)
+                            Menu("Choose") {
+                                let s = suggestions
+                                Section("Recent") {
+                                    ForEach(s.recent, id: \.self) { d in Button(shortPath(d)) { model.draft?.dir = d } }
+                                }
+                                Section("Nearby") {
+                                    ForEach(s.nearby, id: \.self) { d in Button(shortPath(d)) { model.draft?.dir = d } }
+                                }
+                                Divider()
+                                Button("Other folder…", action: chooseFolder)
+                            }
+                            .fixedSize()
+                            .help("Recent folders, the folders next to them, or any folder")
+                        }
+                    }
 
-                Picker("Setup", selection: binding.setupID) {
-                    Text("None").tag("")
-                    ForEach(model.recipes) { Text($0.title).tag($0.id) }
-                    Text("Custom command").tag("custom")
+                    if draft.showOptions {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            label("Name")
+                            TextField("Name", text: binding.name,
+                                      prompt: Text((draft.dir as NSString).lastPathComponent))
+                                .labelsHidden()
+                                .help("The tmux session name. If you leave it empty, Tend uses the folder name, plus a number if that name is taken.")
+                        }
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            label("Command")
+                            TextField("Command", text: binding.command)
+                                .labelsHidden()
+                                .font(.system(.body, design: .monospaced))
+                                .help("The command Tend types into the new session's shell")
+                        }
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            label("Setup")
+                            Picker("Setup", selection: binding.setupID) {
+                                Text("None").tag("")
+                                ForEach(model.recipes) { Text($0.title).tag($0.id) }
+                                Text("Custom command").tag("custom")
+                            }
+                            .labelsHidden()
+                            .fixedSize()
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .onChange(of: draft.setupID) { _, _ in model.draft?.setupText = "" }
+                            .help("Something to run once in the folder before the app starts, like cloning a repository. Restarts don't run it again.")
+                        }
+                        if let field = setupField {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                label(field.label)
+                                TextField(field.label, text: binding.setupText, prompt: Text(field.prompt))
+                                    .labelsHidden()
+                                    .font(.system(.body, design: .monospaced))
+                                    .help(field.help)
+                            }
+                        }
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Color.clear.frame(width: NewSessionForm.labelWidth, height: 0)
+                            Toggle("Restore at login", isOn: binding.autostart)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .help("Start this session again when Tend restores sessions")
+                        }
+                    }
                 }
-                .onChange(of: draft.setupID) { _, _ in model.draft?.setupText = "" }
-                .help("Something to run once in the folder before the app starts, like cloning a repository. Restarts don't run it again.")
-                if let field = setupField {
-                    TextField(field.label, text: binding.setupText, prompt: Text(field.prompt))
-                        .font(.system(.body, design: .monospaced))
-                        .help(field.help)
-                }
-                Toggle("Restore at login", isOn: binding.autostart)
-                    .help("Start this session again when Tend restores sessions")
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack {
+                    Button {
+                        model.draft?.showOptions.toggle()
+                    } label: {
+                        Label("Options", systemImage: draft.showOptions ? "chevron.down" : "chevron.right")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Name, command, setup, and whether to restore at login")
                     Spacer()
                     Button("Cancel") { model.draft = nil }
                     Button("Start") { model.create() }
@@ -624,7 +783,14 @@ struct NewSessionForm: View {
                                   || (setupField != nil && draft.setupText.trimmingCharacters(in: .whitespaces).isEmpty))
                 }
             }
+            .padding(10)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
         }
+    }
+
+    func label(_ text: String) -> some View {
+        Text(text).foregroundStyle(.secondary)
+            .frame(width: NewSessionForm.labelWidth, alignment: .trailing)
     }
 
     /// The text field the chosen setup needs, if any.
@@ -650,112 +816,226 @@ struct NewSessionForm: View {
     }
 }
 
+/// One session. The leading icon shows the app and, in its badge, the
+/// state. The main action always shows; the others show on hover, or always
+/// if you turn that on in Settings. Restart and Start fresh ask first.
 struct ServiceRow: View {
     @EnvironmentObject var model: Model
+    @AppStorage("alwaysShowRowButtons") private var alwaysShowButtons = false
+    @State private var hovering = false
+    @State private var confirming: Confirm?
     let service: Service
 
-    var color: Color {
+    enum Confirm { case restart, fresh }
+
+    var question: AppInfo.Question? { service.app?.question }
+
+    /// Orange means the session needs you. Nothing else uses it.
+    var badge: Color {
+        if question != nil { return .orange }
         switch service.state {
-        case "running": .green
-        case "exited": .orange
-        default: .secondary
+        case "running": return .green
+        case "exited": return .yellow
+        default: return .gray
+        }
+    }
+
+    var status: (text: String, color: Color) {
+        switch service.state {
+        case "running":
+            if let s = service.app?.status { return (s, s == "busy" ? .blue : .secondary) }
+            return ("running", .secondary)
+        case "exited": return ("exited", .secondary)
+        default: return ("stopped", .secondary)
         }
     }
 
     var stateHint: String {
+        var hint: String
         switch service.state {
-        case "running": "\(service.name) is running."
-        case "exited": "\(service.name)'s command exited. The tmux session is still open at a shell prompt."
-        default: "\(service.name) isn't running."
+        case "running": hint = "\(service.name) is running."
+        case "exited": hint = "\(service.name)'s command exited. The tmux session is still open at a shell prompt."
+        default: hint = "\(service.name) isn't running."
         }
+        if let app = service.app {
+            hint += " It runs \(app.name)" + (app.status.map { ", which is \($0)." } ?? ".")
+        }
+        if question != nil { hint += " It's waiting for your answer." }
+        return hint
     }
 
-    var subtitle: String {
-        let dir = service.dir.replacingOccurrences(
-            of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
-        return "\(dir) · \(service.command ?? "shell")"
+    /// The folder, or its parent when the folder's name is the session's name.
+    var folder: String {
+        let last = (service.dir as NSString).lastPathComponent
+        if !last.isEmpty && (last == service.name || last.replacingOccurrences(of: ".", with: "-")
+            .replacingOccurrences(of: ":", with: "-") == service.name) {
+            return shortPath((service.dir as NSString).deletingLastPathComponent) + "/"
+        }
+        return shortPath(service.dir)
+    }
+
+    var details: String {
+        "Folder: \(shortPath(service.dir))\nCommand: \(service.command ?? "shell")"
+            + (service.resume.map { "\nResumes with: \($0)" } ?? "")
     }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Circle().fill(color).frame(width: 8, height: 8)
-                .help(stateHint)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 6) {
-                    if let c = service.app, AppIcons.image(c.icon) != nil {
-                        AppIconView(spec: c.icon)
-                            .help("\(service.name) runs \(c.name)" + (c.status.map { ", which is \($0)." } ?? "."))
-                    }
-                    Text(service.name).fontWeight(.medium)
-                    if let c = service.app {
-                        let named = AppIcons.image(c.icon) == nil
-                        let label = [named ? c.name : nil, c.status].compactMap { $0 }.joined(separator: " ")
-                        if !label.isEmpty {
-                            Text(label)
-                                .font(.caption2)
-                                .padding(.horizontal, 5).padding(.vertical, 1)
-                                .background(
-                                    (c.status == "busy" ? Color.blue : Color.gray).opacity(0.2),
-                                    in: Capsule())
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                leading
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(service.name).fontWeight(.medium).lineLimit(1)
+                        if service.managed && !service.autostart {
+                            Image(systemName: "autostartstop.slash")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .help("Tend doesn't start \(service.name) when it restores sessions. Right-click the row to change that.")
                         }
                     }
-                    if service.state == "exited" {
-                        Text("exited").font(.caption2).foregroundStyle(.orange)
-                    }
-                    if service.managed && !service.autostart {
-                        Text("manual").font(.caption2).foregroundStyle(.secondary)
-                    }
+                    Text(folder).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.head)
+                        .help(details)
                 }
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.middle)
-                if let q = service.app?.question {
-                    Text(q.text).font(.caption).foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 6) {
-                        ForEach(q.answers, id: \.id) { a in
-                            Button(a.label) { model.act(["answer", service.name, a.id]) }
-                                .controlSize(.small)
-                                .help("Answer \(service.name)'s question: \(a.label)")
-                        }
-                    }
-                }
+                Spacer(minLength: 8)
+                trailing
             }
-            Spacer()
-            buttons
+            if let q = question { questionCard(q) }
         }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6)
+            .fill(hovering ? Color.primary.opacity(0.06) : Color.clear))
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
         .contextMenu { menu }
+        .task(id: confirming) {
+            // A confirmation you don't act on goes away by itself.
+            guard confirming != nil, (try? await Task.sleep(for: .seconds(6))) != nil else { return }
+            confirming = nil
+        }
     }
 
-    @ViewBuilder var buttons: some View {
-        HStack(spacing: 4) {
-            if service.state == "stopped" {
-                icon("play.fill", service.resume != nil
-                     ? "Start \(service.name) and reattach to its last session: \(service.resume!)"
-                     : "Start \(service.name).") { model.act(["start", service.name]) }
-            } else {
-                icon("macwindow", "Open \(service.name) in a new terminal window.") { model.act(["open", service.name]) }
-                if service.managed {
-                    icon("arrow.clockwise", service.resume != nil
-                         ? "Restart \(service.name) and reattach to the same session. Right-click to start fresh."
-                         : "Restart \(service.name).") { model.act(["restart", service.name]) }
+    var leading: some View {
+        ZStack(alignment: .bottomTrailing) {
+            Group {
+                if let image = AppIcons.image(service.app?.icon, size: 18) {
+                    Image(nsImage: image)
+                } else {
+                    Image(systemName: "terminal").font(.system(size: 13)).foregroundStyle(.secondary)
                 }
-                icon("stop.fill", "Stop \(service.name) by closing its tmux session." + (service.managed ? " It stays on the list." : "")) { model.act(["stop", service.name]) }
             }
-            if !service.managed {
-                icon("plus.circle", "Track \(service.name), so Tend restores it.") { model.act(["snapshot", service.name]) }
+            .frame(width: 18, height: 18)
+            .opacity(service.state == "stopped" ? 0.45 : 1)
+            Circle().fill(badge)
+                .frame(width: 7, height: 7)
+                .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
+                .offset(x: 2, y: 2)
+        }
+        .help(stateHint)
+    }
+
+    @ViewBuilder var trailing: some View {
+        if let c = confirming {
+            HStack(spacing: 6) {
+                Button("Cancel") { confirming = nil }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                Button(c == .fresh ? "Start fresh" : "Restart", role: .destructive) {
+                    confirming = nil
+                    model.act(c == .fresh ? ["restart", service.name, "--fresh"] : ["restart", service.name])
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .controlSize(.small)
+                .help(c == .fresh
+                      ? "Stop \(service.name) and start its command again, without reattaching to its last session."
+                      : restartHelp)
+            }
+        } else {
+            HStack(spacing: 4) {
+                // Hidden, not removed, so the row doesn't shift on hover.
+                let show = hovering || alwaysShowButtons
+                HStack(spacing: 4) { secondaryButtons }
+                    .opacity(show ? 1 : 0)
+                    .allowsHitTesting(show)
+                Text(status.text).font(.caption).foregroundStyle(status.color)
+                    .padding(.horizontal, 2)
+                primaryButton
             }
         }
+    }
+
+    var restartHelp: String {
+        service.resume != nil
+            ? "Stop \(service.name) and start it again, reattached to the same session."
+            : "Stop \(service.name) and start it again."
+    }
+
+    @ViewBuilder var primaryButton: some View {
+        if service.state == "stopped" {
+            icon("play.fill", service.resume != nil
+                 ? "Start \(service.name) and reattach to its last session: \(service.resume!)"
+                 : "Start \(service.name).") { model.act(["start", service.name]) }
+        } else {
+            icon("macwindow", "Open \(service.name) in a new terminal window.") { model.act(["open", service.name]) }
+        }
+    }
+
+    @ViewBuilder var secondaryButtons: some View {
+        if service.state != "stopped" {
+            if service.managed {
+                icon("arrow.triangle.2.circlepath", restartHelp + " Tend asks first.") { confirming = .restart }
+            } else {
+                icon("plus.circle", "Track \(service.name), so Tend restores it.") { model.act(["snapshot", service.name]) }
+            }
+            icon("stop.fill", "Stop \(service.name) by closing its tmux session." + (service.managed ? " It stays on the list." : "")) { model.act(["stop", service.name]) }
+        }
+    }
+
+    func questionCard(_ q: AppInfo.Question) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label {
+                Text(q.text).fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "questionmark.bubble").foregroundStyle(.orange)
+            }
+            .font(.callout)
+            HStack(spacing: 6) {
+                Spacer()
+                ForEach(q.answers, id: \.id) { a in
+                    Button(a.label) { model.act(["answer", service.name, a.id]) }
+                        .controlSize(.small)
+                        .help("Answer \(service.name)'s question: \(a.label)")
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
     }
 
     @ViewBuilder var menu: some View {
+        if service.state == "stopped" {
+            Button("Start") { model.act(["start", service.name]) }
+        } else {
+            Button("Open in terminal") { model.act(["open", service.name]) }
+        }
         if service.managed {
-            Button("Start fresh") {
-                model.act(["restart", service.name, "--fresh"])
+            Divider()
+            if service.state != "stopped" {
+                Button("Restart") { confirming = .restart }
             }
+            Button("Start fresh") { confirming = .fresh }
             Button(service.autostart ? "Don't restore at login" : "Restore at login") {
                 model.act(["autostart", service.name, service.autostart ? "off" : "on"])
             }
-            Divider()
+        }
+        if service.state != "stopped" {
+            Button("Stop") { model.act(["stop", service.name]) }
+        }
+        Divider()
+        if service.managed {
             Button("Stop tracking") { model.act(["rm", service.name]) }
         } else {
             Button("Track") { model.act(["snapshot", service.name]) }
@@ -769,43 +1049,128 @@ struct ServiceRow: View {
     }
 }
 
-/// The apps tend recognizes. Turn one off to stop recognizing it, or add any
-/// program by choosing its executable.
-struct AppsSection: View {
+// MARK: - Settings
+
+struct SettingsView: View {
     @EnvironmentObject var model: Model
-    @State private var expanded = false
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            VStack(alignment: .leading, spacing: 6) {
+        VStack(spacing: 0) {
+            if let error = model.error {
+                Banner(text: error, systemImage: "xmark.octagon.fill", tint: .red,
+                       help: "The last action failed.") { model.error = nil }
+                    .padding([.horizontal, .top], 12)
+            }
+            TabView {
+                GeneralPane().tabItem { Label("General", systemImage: "gearshape") }
+                AppsPane().tabItem { Label("Apps", systemImage: "square.grid.2x2") }
+                TerminalPane().tabItem { Label("Terminal", systemImage: "terminal") }
+                AccountsPane().tabItem { Label("Accounts", systemImage: "person.2") }
+            }
+        }
+        .frame(width: 500, height: 380)
+    }
+}
+
+struct GeneralPane: View {
+    @EnvironmentObject var model: Model
+    @AppStorage("alwaysShowRowButtons") private var alwaysShowButtons = false
+    @State private var openAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var cliInstalled = false
+
+    var body: some View {
+        Form {
+            Section("Startup") {
+                Toggle("Open Tend at login", isOn: $openAtLogin)
+                    .help("Open Tend when you log in. With the setting below, this restores your sessions after the Mac starts.")
+                    .onChange(of: openAtLogin) { _, on in
+                        do {
+                            if on { try SMAppService.mainApp.register() }
+                            else { try SMAppService.mainApp.unregister() }
+                        } catch {
+                            model.error = "Couldn't change the login item: \(error.localizedDescription)"
+                            openAtLogin = SMAppService.mainApp.status == .enabled
+                        }
+                    }
+                Toggle("Restore sessions after the Mac starts", isOn: model.$restoreOnLaunch)
+                    .help("The first time Tend opens after the Mac starts, start every tracked session that's set to restore. If you quit Tend or it crashes, your sessions keep running, and opening Tend again doesn't start or stop anything.")
+            }
+            Section("Panel") {
+                Toggle("Always show session buttons", isOn: $alwaysShowButtons)
+                    .help("Show every row's buttons all the time, not only when the pointer is over the row. The Open or Start button always shows.")
+            }
+            Section("Command line") {
+                LabeledContent("tend") {
+                    if cliInstalled {
+                        Text(shortPath(Model.cliLink.path)).foregroundStyle(.secondary).textSelection(.enabled)
+                    } else {
+                        Button("Install") {
+                            model.installCLI()
+                            cliInstalled = model.cliInstalled
+                        }
+                        .disabled(Model.setupProblem != nil)
+                        .help("Link tend into ~/.local/bin, so you can run it in a terminal and over ssh. Add ~/.local/bin to your PATH if it isn't there already.")
+                    }
+                }
+                LabeledContent("Config") {
+                    Button("Open services.json") {
+                        NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser
+                            .appendingPathComponent(".config/tend/services.json"))
+                    }
+                    .help("Open ~/.config/tend/services.json, the list of tracked sessions.")
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear { cliInstalled = model.cliInstalled }
+    }
+}
+
+/// The apps tend recognizes. Turn one off to stop recognizing it, or add any
+/// program by choosing its executable.
+struct AppsPane: View {
+    @EnvironmentObject var model: Model
+
+    var body: some View {
+        Form {
+            Section {
                 ForEach(model.apps) { app in
                     Toggle(isOn: Binding(
                         get: { app.enabled },
                         set: { model.act(["apps", $0 ? "enable" : "disable", app.id]) }
                     )) {
-                        HStack(spacing: 6) {
-                            AppIconView(spec: app.icon)
+                        HStack(spacing: 8) {
+                            AppIconView(spec: app.icon, size: 20)
                             VStack(alignment: .leading, spacing: 0) {
-                                Text(app.title + (app.builtin ? " (built in)" : ""))
+                                HStack(spacing: 6) {
+                                    Text(app.title)
+                                    if app.builtin {
+                                        Text("Built in").font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
                                 Text(app.rules).font(.caption).foregroundStyle(.secondary)
                                     .lineLimit(1).truncationMode(.middle)
                             }
                         }
                     }
-                    .help("Recognize processes that match: \(app.rules)")
+                    .help("Recognize processes that match: \(app.rules)" + (app.builtin ? "" : ". Right-click to remove it."))
                     .contextMenu {
                         if !app.builtin {
                             Button("Remove") { model.act(["apps", "rm", app.id]) }
                         }
                     }
                 }
-                Button("Add app…", action: addApp)
-                    .help("Choose a program. Tend then recognizes it when it runs in a tmux session.")
+            } header: {
+                Text("The programs Tend looks for in each tmux session")
+            } footer: {
+                HStack {
+                    Spacer()
+                    Button("Add app…", action: addApp)
+                        .help("Choose a program. Tend then recognizes it when it runs in a tmux session.")
+                }
             }
-            .padding(.top, 4)
-        } label: {
-            Text("Apps").help("The programs Tend looks for in each tmux session")
         }
+        .formStyle(.grouped)
     }
 
     func addApp() {
@@ -830,16 +1195,15 @@ struct AppsSection: View {
 
 /// How the open button opens a session: which terminal app, and which
 /// command it runs there. Use tmux control mode for iTerm2's tmux integration.
-struct TerminalSection: View {
+struct TerminalPane: View {
     @EnvironmentObject var model: Model
-    @State private var expanded = false
     @State private var custom = ""
     @State private var editingCustom = false
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
+        Form {
             if let t = model.terminal {
-                VStack(alignment: .leading, spacing: 6) {
+                Section {
                     Picker("App", selection: Binding(
                         get: { t.app },
                         set: { model.setTerminal(app: $0) }
@@ -866,11 +1230,6 @@ struct TerminalSection: View {
                     }
                     .help("tmux attach shows the session in one terminal window. tmux -CC uses control mode: iTerm2 shows each tmux window as a native window or tab.")
 
-                    if t.mode == "control" && t.app != "iTerm" {
-                        Text("tmux -CC needs iTerm2. Terminal shows control mode as raw text.")
-                            .font(.caption).foregroundStyle(.orange)
-                    }
-
                     if editingCustom || t.mode == "custom" {
                         HStack {
                             TextField("Command", text: $custom)
@@ -882,13 +1241,21 @@ struct TerminalSection: View {
                         }
                         .help("The command to run in the new window. {tmux} is the path to tmux, {target} is the session's tmux target, and {name} is the session name.")
                     }
+                } header: {
+                    Text("How the open button opens a session")
+                } footer: {
+                    if t.mode == "control" && t.app != "iTerm" {
+                        Label("tmux -CC needs iTerm2. Terminal shows control mode as raw text.",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
                 }
-                .padding(.top, 4)
                 .onAppear { if t.mode == "custom" { custom = t.attach } }
+            } else {
+                Text("Tend couldn't read its terminal settings.").foregroundStyle(.secondary)
             }
-        } label: {
-            Text("Terminal").help("How the open button opens a session in a terminal")
         }
+        .formStyle(.grouped)
     }
 
     func saveCustom() {
@@ -900,13 +1267,12 @@ struct TerminalSection: View {
 /// Other accounts on this Mac, like a family member's under fast user switching.
 /// Tend warns when a watched account isn't logged in or isn't running Tend,
 /// because then that account's sessions aren't running.
-struct AccountsSection: View {
+struct AccountsPane: View {
     @EnvironmentObject var model: Model
-    @State private var expanded = false
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            VStack(alignment: .leading, spacing: 6) {
+        Form {
+            Section {
                 ForEach(model.accounts?.watched ?? []) { account in
                     HStack {
                         Circle().fill(account.ok ? Color.green : Color.orange).frame(width: 8, height: 8)
@@ -924,7 +1290,7 @@ struct AccountsSection: View {
                 }
                 let available = model.accounts?.available ?? []
                 if available.isEmpty && (model.accounts?.watched.isEmpty ?? true) {
-                    Text("This Mac has no other accounts.").font(.caption).foregroundStyle(.secondary)
+                    Text("This Mac has no other accounts.").foregroundStyle(.secondary)
                 } else if !available.isEmpty {
                     Menu("Watch an account") {
                         ForEach(available, id: \.self) { a in
@@ -934,10 +1300,13 @@ struct AccountsSection: View {
                     .fixedSize()
                     .help("Warn me when this account isn't logged in or isn't running Tend. Install Tend in that account too, with Open Tend at login on.")
                 }
+            } header: {
+                Text("Other accounts on this Mac")
+            } footer: {
+                Text("Tend warns you when a watched account isn't logged in or isn't running Tend, because then that account's sessions aren't running.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            .padding(.top, 4)
-        } label: {
-            Text("Other accounts").help("Check that Tend runs in other accounts on this Mac, so their sessions run too")
         }
+        .formStyle(.grouped)
     }
 }

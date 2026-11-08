@@ -184,6 +184,24 @@ deliberate.
   can't split a command into arguments safely.
 - **The app's new-session form lives in the model**, not view state, because
   the menu bar panel can close while a folder picker is open.
+- **The panel is for sessions; settings have their own window.** Apps,
+  Terminal, Accounts, startup, the command-line tool, and the config file
+  are in a `Settings` scene, so they don't compete with the sessions.
+- **Rows keep their order.** the user didn't want sessions that need attention
+  moved to the top. Instead, a question shows as a card under its row, and
+  errors and account problems show as banners at the top of the panel.
+- **Orange means "needs you."** Questions and account problems use it.
+  Nothing else does: an exited session's badge is yellow.
+- **Restart asks first, inline.** Restart and Start fresh turn the row's
+  buttons into a red confirm button that goes away after 6 seconds. Restart
+  has its own icon, so it doesn't look like refresh. An inline confirm was
+  chosen over `confirmationDialog`, which is unreliable from a menu bar panel.
+- **Row buttons show on hover**, except the main one (Open, or Start). A
+  setting shows them all the time. The hidden buttons keep their space, so
+  the row doesn't shift.
+- **Action errors and refresh errors are separate.** An action's error stays
+  until you close it or take another action. Before, the refresh that follows
+  every action cleared it right away, so most action errors never showed.
 
 ## Is tmux core?
 
@@ -214,10 +232,13 @@ Untested, in rough order of risk:
    has expired, the restart starts a new conversation, and the old one stays
    in the app's history.
 2. **The plus button** starting a real `claude rc` session.
-3. **The app's UI** hasn't been seen by an agent: the panel, the Apps section,
-   the new-session form, and the folder pickers (`NSOpenPanel` from a menu bar
-   panel can appear behind other windows). Also unseen: app icons on rows,
-   the Trust and Don't trust buttons, and the Setup picker.
+3. **The app's UI** has been seen only as offscreen renders: the panel, the
+   new-session form, the question card, and the Settings panes, drawn from
+   `NSHostingView` against a scratch config. Not seen in the real menu bar
+   panel: hover (row buttons and highlight), the inline Restart confirmation,
+   whether Settings comes to the front when opened from the panel, the
+   keyboard shortcuts, and the folder pickers (`NSOpenPanel` from a menu bar
+   panel can appear behind other windows).
 4. **Open in terminal** (iTerm through AppleScript) from inside a tend
    session fails with "Not authorized to send Apple events to iTerm
    (-1743)". The tmux server is started by the `com.example.tmux-server` launch
