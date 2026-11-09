@@ -41,18 +41,26 @@ struct Recipe: Decodable, Identifiable, Hashable {
 }
 
 /// Pictures for apps, from a profile's `icon`: a bundle ID, or the path to a
-/// .app or an image file. Each is looked up once.
+/// .app or an image file. An icon that's found is kept; one that isn't is
+/// looked up again a minute later, in case you install the app meanwhile.
 @MainActor
 enum AppIcons {
-    private static var cache: [String: NSImage?] = [:]
+    private static var found: [String: NSImage] = [:]
+    private static var missing: [String: Date] = [:]
+    private static let retryAfter: TimeInterval = 60
 
     static func image(_ spec: String?, size: CGFloat = 16) -> NSImage? {
         guard let spec, !spec.isEmpty else { return nil }
         let key = "\(spec)@\(size)"
-        if let hit = cache[key] { return hit }
-        let image = load(spec)?.copy() as? NSImage
-        image?.size = NSSize(width: size, height: size)
-        cache[key] = image
+        if let hit = found[key] { return hit }
+        if let since = missing[key], Date().timeIntervalSince(since) < retryAfter { return nil }
+        guard let image = load(spec)?.copy() as? NSImage else {
+            missing[key] = Date()
+            return nil
+        }
+        image.size = NSSize(width: size, height: size)
+        found[key] = image
+        missing[key] = nil
         return image
     }
 
@@ -130,28 +138,66 @@ struct Accounts: Decodable {
 /// A conversation that was dropped when its session restarted, from
 /// `tend dropped --json` with snake-case keys converted.
 struct DroppedChat: Decodable, Identifiable, Hashable {
-    let service: String
+    let session: String
     let id: String
     let label: String?
     let droppedAt: Int
 }
 
-struct Service: Decodable, Identifiable, Hashable {
+/// Folders to suggest for a new session, from `tend folders --json`.
+struct Folders: Decodable {
+    let recent: [String]
+    let nearby: [String]
+    let parents: [String]
+}
+
+/// Where tend keeps its files, from `tend config --json`.
+struct ConfigPaths: Decodable {
+    let config: String
+    let state: String
+}
+
+/// A session's state: running, its command exited (the tmux session is
+/// still open at a shell prompt), or stopped (no tmux session).
+enum SessionState: String, Decodable {
+    case running, exited, stopped
+}
+
+/// A tracked session, or a tmux session tend doesn't track, from
+/// `tend ls --json`.
+struct Session: Decodable, Identifiable, Hashable {
     let name: String
     let dir: String
+    /// Whether the session is named after its folder.
+    let namedAfterDir: Bool
     let command: String?
     let resume: String?
     let autostart: Bool
     let managed: Bool
-    let state: String
+    let state: SessionState
     let attached: Bool
     let app: AppInfo?
     var id: String { name }
 }
 
+/// What a run of `tend` printed, and whether it worked.
+struct TendResult {
+    /// Standard output, if tend exited with status 0.
+    let output: Data?
+    /// Standard error, if tend failed.
+    let error: String?
+}
+
+/// Decode tend's JSON, which uses snake_case keys.
+func decodeTend<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    return try decoder.decode(type, from: data)
+}
+
 @MainActor
 final class Model: ObservableObject {
-    @Published var services: [Service] = []
+    @Published var sessions: [Session] = []
     /// Why the last action failed, like a start or a new session. It stays
     /// until you close it or take another action.
     @Published var error: String?
@@ -162,6 +208,9 @@ final class Model: ObservableObject {
     @Published var terminal: TerminalSettings?
     @Published var accounts: Accounts?
     @Published var dropped: [DroppedChat] = []
+    /// Suggestions for the new-session form, loaded when the form opens.
+    @Published var folders: Folders?
+    @Published var configPaths: ConfigPaths?
 
     /// When each watched account's problem started, and which problems Tend
     /// has already posted a notification for.
@@ -188,7 +237,14 @@ final class Model: ObservableObject {
         /// Whether the form shows Name, Command, Setup, and Restore at login.
         var showOptions = false
     }
-    @AppStorage("restoreOnLaunch") var restoreOnLaunch = true
+
+    /// The "Restore sessions after the Mac starts" setting. GeneralPane
+    /// changes it with @AppStorage, which only updates views, so the model
+    /// reads it from UserDefaults when it needs it.
+    static let restoreOnLaunchKey = "restoreOnLaunch"
+    var restoreOnLaunch: Bool {
+        UserDefaults.standard.object(forKey: Model.restoreOnLaunchKey) as? Bool ?? true
+    }
 
     nonisolated static let tend = Bundle.main.url(forResource: "tend", withExtension: nil)?.path
         ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/tend").path
@@ -197,7 +253,13 @@ final class Model: ObservableObject {
     nonisolated static let cliLink = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".local/bin/tend")
 
-    nonisolated static let path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    /// The PATH tend runs with: Homebrew's folders, so `/usr/bin/env python3`
+    /// finds Homebrew's Python first, then the app's own PATH. tend adds
+    /// the other folders it needs itself.
+    nonisolated static let path = (["/opt/homebrew/bin", "/usr/local/bin"]
+        + (ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin").split(separator: ":").map(String.init))
+        .reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+        .joined(separator: ":")
 
     /// Why tend can't run on this Mac, or nil if it can. tend is a Python
     /// script, and macOS only ships Python with the developer tools.
@@ -228,7 +290,7 @@ final class Model: ObservableObject {
             // Restore only on the first launch since the Mac started. A
             // relaunch, like after a crash, checks in and changes nothing.
             if restoreOnLaunch { await run(["restore", "--once"]) }
-            await loadTerminal()
+            await loadSettings()
             while true {
                 await refresh()
                 try? await Task.sleep(for: .seconds(5))
@@ -236,13 +298,13 @@ final class Model: ObservableObject {
         }
     }
 
-    var tracked: [Service] { services.filter(\.managed) }
-    var untracked: [Service] { services.filter { !$0.managed } }
-    var runningCount: Int { services.filter { $0.state == "running" }.count }
+    var tracked: [Session] { sessions.filter(\.managed) }
+    var untracked: [Session] { sessions.filter { !$0.managed } }
+    var runningCount: Int { sessions.filter { $0.state == .running }.count }
     /// Tracked sessions that `tend restore` would start.
-    var restorable: [Service] { tracked.filter { $0.autostart && $0.state == "stopped" } }
-    var waitingCount: Int { services.filter { $0.app?.question != nil }.count }
-    var anyBusy: Bool { services.contains { $0.app?.status == "busy" } }
+    var restorable: [Session] { tracked.filter { $0.autostart && $0.state == .stopped } }
+    var waitingCount: Int { sessions.filter { $0.app?.question != nil }.count }
+    var anyBusy: Bool { sessions.contains { $0.app?.status == "busy" } }
     var anyQuestion: Bool { waitingCount > 0 }
     var accountProblems: [AccountStatus] { accounts?.watched.filter { !$0.ok } ?? [] }
 
@@ -252,8 +314,8 @@ final class Model: ObservableObject {
     }
 
     /// Run tend. Returns its output, or the error it printed.
-    func call(_ args: [String]) async -> (data: Data?, error: String?) {
-        let result = await Task.detached { () -> (Int32, Data, String) in
+    func call(_ args: [String]) async -> TendResult {
+        await Task.detached { () -> TendResult in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: Model.tend)
             p.arguments = args
@@ -264,17 +326,20 @@ final class Model: ObservableObject {
             p.standardOutput = out
             p.standardError = err
             do { try p.run() } catch {
-                return (-1, Data(), "Couldn't run \(Model.tend): \(error.localizedDescription)")
+                return TendResult(output: nil, error: "Couldn't run \(Model.tend): \(error.localizedDescription)")
             }
+            // Read standard error on another thread, so a full stderr pipe
+            // can't block tend while this thread waits for stdout to end.
+            let errReader = Task.detached { err.fileHandleForReading.readDataToEndOfFile() }
             let data = out.fileHandleForReading.readDataToEndOfFile()
-            let errData = err.fileHandleForReading.readDataToEndOfFile()
+            let errData = await errReader.value
             p.waitUntilExit()
-            return (p.terminationStatus, data, String(decoding: errData, as: UTF8.self))
+            guard p.terminationStatus == 0 else {
+                let message = String(decoding: errData, as: UTF8.self)
+                return TendResult(output: nil, error: message.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            return TendResult(output: data, error: nil)
         }.value
-        if result.0 != 0 {
-            return (nil, result.2.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return (result.1, nil)
     }
 
     /// Run tend for an action. If it fails, show its error until you close
@@ -283,33 +348,46 @@ final class Model: ObservableObject {
     func run(_ args: [String]) async -> Data? {
         let result = await call(args)
         if let message = result.error { error = message }
-        return result.data
+        return result.output
     }
 
+    /// Read what changes on its own: the sessions, other accounts, and
+    /// dropped conversations. Tend runs this every 5 seconds.
     func refresh() async {
         var outputs: [Data] = []
-        for args in [["ls", "--json"], ["apps", "--json"], ["accounts", "--json"], ["recipes", "--json"],
-                     ["dropped", "--json"]] {
+        for args in [["ls", "--json"], ["accounts", "--json"], ["dropped", "--json"]] {
             let result = await call(args)
-            guard let data = result.data else {
+            guard let data = result.output else {
                 refreshError = result.error
                 return
             }
             outputs.append(data)
         }
         do {
-            services = try JSONDecoder().decode([Service].self, from: outputs[0])
-            apps = try JSONDecoder().decode([AppProfile].self, from: outputs[1])
-            let snake = JSONDecoder()
-            snake.keyDecodingStrategy = .convertFromSnakeCase
-            accounts = try snake.decode(Accounts.self, from: outputs[2])
-            recipes = try JSONDecoder().decode([Recipe].self, from: outputs[3])
-            dropped = try snake.decode([DroppedChat].self, from: outputs[4])
+            sessions = try decodeTend([Session].self, from: outputs[0])
+            accounts = try decodeTend(Accounts.self, from: outputs[1])
+            dropped = try decodeTend([DroppedChat].self, from: outputs[2])
             checkAccounts()
             refreshError = nil
         } catch {
             refreshError = "Couldn't read tend's output: \(error.localizedDescription)"
         }
+    }
+
+    /// Read what changes only when you change it: the apps, recipes,
+    /// terminal settings, and where the config is. Tend runs this when it
+    /// opens and after each action.
+    func loadSettings() async {
+        if let data = await run(["apps", "--json"]) { apps = (try? decodeTend([AppProfile].self, from: data)) ?? apps }
+        if let data = await run(["recipes", "--json"]) { recipes = (try? decodeTend([Recipe].self, from: data)) ?? recipes }
+        if let data = await run(["config", "--json"]) { configPaths = try? decodeTend(ConfigPaths.self, from: data) }
+        await loadTerminal()
+    }
+
+    /// Load the new-session form's folder suggestions.
+    func loadFolders() async {
+        guard let data = await run(["folders", "--json"]) else { return }
+        folders = try? decodeTend(Folders.self, from: data)
     }
 
     /// Post one notification for each account problem that lasts longer
@@ -351,7 +429,7 @@ final class Model: ObservableObject {
 
     func loadTerminal() async {
         guard let data = await run(["terminal", "--json"]) else { return }
-        terminal = try? JSONDecoder().decode(TerminalSettings.self, from: data)
+        terminal = try? decodeTend(TerminalSettings.self, from: data)
     }
 
     /// Change the terminal app or the attach command (a preset name or a command).
@@ -418,6 +496,8 @@ final class Model: ObservableObject {
             error = nil
             await run(args)
             await refresh()
+            // Actions on apps and recipes change the settings.
+            if ["apps", "recipes"].contains(args.first) { await loadSettings() }
             busy = false
         }
     }
@@ -434,13 +514,15 @@ final class Model: ObservableObject {
                 ?? FileManager.default.homeDirectoryForCurrentUser.path,
             command: app?.launch ?? "",
             showOptions: app == nil)
+        Task { await loadFolders() }
     }
 }
 
 /// A path with the home folder shown as ~.
 func shortPath(_ path: String) -> String {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
-    return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+    if path == home { return "~" }
+    return path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
 }
 
 @main
@@ -479,10 +561,19 @@ struct ContentView: View {
 
     var summary: String {
         var parts = [model.runningCount == 0 ? "Nothing running" : "\(model.runningCount) running"]
-        let stopped = model.tracked.filter { $0.state == "stopped" }.count
+        let stopped = model.tracked.filter { $0.state == .stopped }.count
         if stopped > 0 { parts.append("\(stopped) stopped") }
         if model.waitingCount > 0 { parts.append("\(model.waitingCount) waiting for you") }
         return parts.joined(separator: " · ")
+    }
+
+    /// The Restore button's tooltip, which names the sessions it starts.
+    var restoreHelp: String {
+        let names = model.restorable.map(\.name).joined(separator: ", ")
+        let which = model.restorable.count == 1
+            ? "the tracked session that's set to restore and isn't running"
+            : "the \(model.restorable.count) tracked sessions that are set to restore and aren't running"
+        return "Start \(which): \(names). Sessions that can resume, like Claude, reattach to their last conversation."
     }
 
     var body: some View {
@@ -492,7 +583,7 @@ struct ContentView: View {
 
             if model.draft != nil { NewSessionForm() }
 
-            if model.services.isEmpty && model.draft == nil && model.refreshError == nil {
+            if model.sessions.isEmpty && model.draft == nil && model.refreshError == nil {
                 emptyState
             }
 
@@ -501,10 +592,10 @@ struct ContentView: View {
                     SectionHeader("Sessions") {
                         if !model.restorable.isEmpty {
                             Button("Restore \(model.restorable.count)") { model.act(["restore"]) }
-                                .help("Start the \(model.restorable.count == 1 ? "tracked session" : "\(model.restorable.count) tracked sessions") that \(model.restorable.count == 1 ? "is" : "are") set to restore and \(model.restorable.count == 1 ? "isn't" : "aren't") running: \(model.restorable.map(\.name).joined(separator: ", ")). Sessions that can resume, like Claude, reattach to their last conversation.")
+                                .help(restoreHelp)
                         }
                     }
-                    ForEach(model.tracked) { ServiceRow(service: $0) }
+                    ForEach(model.tracked) { SessionRow(session: $0) }
                 }
             }
 
@@ -514,7 +605,7 @@ struct ContentView: View {
                         Button("Track all") { model.act(["snapshot"]) }
                             .help("Add every untracked tmux session to the list, so Tend restores it.")
                     }
-                    ForEach(model.untracked) { ServiceRow(service: $0) }
+                    ForEach(model.untracked) { SessionRow(session: $0) }
                 }
             }
 
@@ -665,15 +756,15 @@ struct DroppedBanner: View {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(chat.label ?? chat.id).lineLimit(1)
-                        Text("\(chat.service) · \(ago(chat.droppedAt))")
+                        Text("\(chat.session) · \(ago(chat.droppedAt))")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     .help(chat.id)
                     Spacer(minLength: 8)
-                    Button("Recover") { model.act(["recover", chat.service, chat.id]) }
+                    Button("Recover") { model.act(["recover", chat.session, chat.id]) }
                         .controlSize(.small)
                         .help("Reopen this conversation in a new session in the same folder, connected to the Claude app. Tasks it was running in the background don't come back, so ask it to start them again.")
-                    Button { model.act(["dismiss", chat.service, chat.id]) } label: { Image(systemName: "xmark") }
+                    Button { model.act(["dismiss", chat.session, chat.id]) } label: { Image(systemName: "xmark") }
                         .buttonStyle(.borderless)
                         .foregroundStyle(.secondary)
                         .help("Take this chat off the list. Its conversation stays on this Mac.")
@@ -714,7 +805,7 @@ struct SectionHeader<Trailing: View>: View {
 }
 
 /// The form behind the plus button. It runs `tend new`, which tracks the
-/// session and starts it, like rc-spawn but for any app.
+/// session and starts it.
 struct NewSessionForm: View {
     @EnvironmentObject var model: Model
 
@@ -723,20 +814,10 @@ struct NewSessionForm: View {
 
     var launchable: [AppProfile] { model.apps.filter { $0.enabled && $0.launch != nil } }
 
-    /// Folders you've used, and the folders next to them (your other projects).
+    /// Folders you've used, and the folders next to them (your other
+    /// projects), most recently changed first, from `tend folders`.
     var suggestions: (recent: [String], nearby: [String]) {
-        let recent = Array(Set(model.services.map(\.dir))).sorted()
-        let fm = FileManager.default
-        var nearby = Set<String>()
-        for parent in Set(recent.map { ($0 as NSString).deletingLastPathComponent }) {
-            for child in (try? fm.contentsOfDirectory(atPath: parent)) ?? [] where !child.hasPrefix(".") {
-                let path = (parent as NSString).appendingPathComponent(child)
-                var isDir: ObjCBool = false
-                if fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue,
-                   !recent.contains(path) { nearby.insert(path) }
-            }
-        }
-        return (recent, Array(nearby).sorted().prefix(40).map { $0 })
+        (model.folders?.recent ?? [], Array((model.folders?.nearby ?? []).prefix(40)))
     }
 
     var body: some View {
@@ -889,45 +970,45 @@ struct NewSessionForm: View {
 /// One session. The leading icon shows the app and, in its badge, the
 /// state. The main action always shows; the others show on hover, or always
 /// if you turn that on in Settings. Restart and Start fresh ask first.
-struct ServiceRow: View {
+struct SessionRow: View {
     @EnvironmentObject var model: Model
     @AppStorage("alwaysShowRowButtons") private var alwaysShowButtons = false
     @State private var hovering = false
     @State private var confirming: Confirm?
-    let service: Service
+    let session: Session
 
     enum Confirm { case restart, fresh }
 
-    var question: AppInfo.Question? { service.app?.question }
+    var question: AppInfo.Question? { session.app?.question }
 
     /// Orange means the session needs you. Nothing else uses it.
     var badge: Color {
         if question != nil { return .orange }
-        switch service.state {
-        case "running": return .green
-        case "exited": return .yellow
+        switch session.state {
+        case .running: return .green
+        case .exited: return .yellow
         default: return .gray
         }
     }
 
     var status: (text: String, color: Color) {
-        switch service.state {
-        case "running":
-            if let s = service.app?.status { return (s, s == "busy" ? .blue : .secondary) }
+        switch session.state {
+        case .running:
+            if let s = session.app?.status { return (s, s == "busy" ? .blue : .secondary) }
             return ("running", .secondary)
-        case "exited": return ("exited", .secondary)
+        case .exited: return ("exited", .secondary)
         default: return ("stopped", .secondary)
         }
     }
 
     var stateHint: String {
         var hint: String
-        switch service.state {
-        case "running": hint = "\(service.name) is running."
-        case "exited": hint = "\(service.name)'s command exited. The tmux session is still open at a shell prompt."
-        default: hint = "\(service.name) isn't running."
+        switch session.state {
+        case .running: hint = "\(session.name) is running."
+        case .exited: hint = "\(session.name)'s command exited. The tmux session is still open at a shell prompt."
+        default: hint = "\(session.name) isn't running."
         }
-        if let app = service.app {
+        if let app = session.app {
             hint += " It runs \(app.name)" + (app.status.map { ", which is \($0)." } ?? ".")
         }
         if question != nil { hint += " It's waiting for your answer." }
@@ -936,17 +1017,15 @@ struct ServiceRow: View {
 
     /// The folder, or its parent when the folder's name is the session's name.
     var folder: String {
-        let last = (service.dir as NSString).lastPathComponent
-        if !last.isEmpty && (last == service.name || last.replacingOccurrences(of: ".", with: "-")
-            .replacingOccurrences(of: ":", with: "-") == service.name) {
-            return shortPath((service.dir as NSString).deletingLastPathComponent) + "/"
+        if session.namedAfterDir {
+            return shortPath((session.dir as NSString).deletingLastPathComponent) + "/"
         }
-        return shortPath(service.dir)
+        return shortPath(session.dir)
     }
 
     var details: String {
-        "Folder: \(shortPath(service.dir))\nCommand: \(service.command ?? "shell")"
-            + (service.resume.map { "\nResumes with: \($0)" } ?? "")
+        "Folder: \(shortPath(session.dir))\nCommand: \(session.command ?? "shell")"
+            + (session.resume.map { "\nResumes with: \($0)" } ?? "")
     }
 
     var body: some View {
@@ -955,12 +1034,12 @@ struct ServiceRow: View {
                 leading
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 4) {
-                        Text(service.name).fontWeight(.medium).lineLimit(1)
-                        if service.managed && !service.autostart {
+                        Text(session.name).fontWeight(.medium).lineLimit(1)
+                        if session.managed && !session.autostart {
                             Image(systemName: "autostartstop.slash")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                                .help("Tend doesn't start \(service.name) when it restores sessions. Right-click the row to change that.")
+                                .help("Tend doesn't start \(session.name) when it restores sessions. Right-click the row to change that.")
                         }
                     }
                     Text(folder).font(.caption).foregroundStyle(.secondary)
@@ -989,14 +1068,14 @@ struct ServiceRow: View {
     var leading: some View {
         ZStack(alignment: .bottomTrailing) {
             Group {
-                if let image = AppIcons.image(service.app?.icon, size: 18) {
+                if let image = AppIcons.image(session.app?.icon, size: 18) {
                     Image(nsImage: image)
                 } else {
                     Image(systemName: "terminal").font(.system(size: 13)).foregroundStyle(.secondary)
                 }
             }
             .frame(width: 18, height: 18)
-            .opacity(service.state == "stopped" ? 0.45 : 1)
+            .opacity(session.state == .stopped ? 0.45 : 1)
             // Cut a gap around the dot out of the icon, rather than drawing a
             // ring, so the panel's material shows through.
             .mask {
@@ -1023,13 +1102,13 @@ struct ServiceRow: View {
                     .controlSize(.small)
                 Button(c == .fresh ? "Start fresh" : "Restart", role: .destructive) {
                     confirming = nil
-                    model.act(c == .fresh ? ["restart", service.name, "--fresh"] : ["restart", service.name])
+                    model.act(c == .fresh ? ["restart", session.name, "--fresh"] : ["restart", session.name])
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
                 .controlSize(.small)
                 .help(c == .fresh
-                      ? "Stop \(service.name) and start its command again, without reattaching to its last session."
+                      ? "Stop \(session.name) and start its command again, without reattaching to its last session."
                       : restartHelp)
             }
         } else {
@@ -1047,29 +1126,29 @@ struct ServiceRow: View {
     }
 
     var restartHelp: String {
-        service.resume != nil
-            ? "Stop \(service.name) and start it again, reattached to the same session."
-            : "Stop \(service.name) and start it again."
+        session.resume != nil
+            ? "Stop \(session.name) and start it again, reattached to the same session."
+            : "Stop \(session.name) and start it again."
     }
 
     @ViewBuilder var primaryButton: some View {
-        if service.state == "stopped" {
-            icon("play.fill", service.resume != nil
-                 ? "Start \(service.name) and reattach to its last session: \(service.resume!)"
-                 : "Start \(service.name).") { model.act(["start", service.name]) }
+        if session.state == .stopped {
+            icon("play.fill", session.resume != nil
+                 ? "Start \(session.name) and reattach to its last session: \(session.resume!)"
+                 : "Start \(session.name).") { model.act(["start", session.name]) }
         } else {
-            icon("macwindow", "Open \(service.name) in a new terminal window.") { model.act(["open", service.name]) }
+            icon("macwindow", "Open \(session.name) in a new terminal window.") { model.act(["open", session.name]) }
         }
     }
 
     @ViewBuilder var secondaryButtons: some View {
-        if service.state != "stopped" {
-            if service.managed {
+        if session.state != .stopped {
+            if session.managed {
                 icon("arrow.triangle.2.circlepath", restartHelp + " Tend asks first.") { confirming = .restart }
             } else {
-                icon("plus.circle", "Track \(service.name), so Tend restores it.") { model.act(["snapshot", service.name]) }
+                icon("plus.circle", "Track \(session.name), so Tend restores it.") { model.act(["snapshot", session.name]) }
             }
-            icon("stop.fill", "Stop \(service.name) by closing its tmux session." + (service.managed ? " It stays on the list." : "")) { model.act(["stop", service.name]) }
+            icon("stop.fill", "Stop \(session.name) by closing its tmux session." + (session.managed ? " It stays on the list." : "")) { model.act(["stop", session.name]) }
         }
     }
 
@@ -1084,9 +1163,9 @@ struct ServiceRow: View {
             HStack(spacing: 6) {
                 Spacer()
                 ForEach(q.answers, id: \.id) { a in
-                    Button(a.label) { model.act(["answer", service.name, a.id]) }
+                    Button(a.label) { model.act(["answer", session.name, a.id]) }
                         .controlSize(.small)
-                        .help("Answer \(service.name)'s question: \(a.label)")
+                        .help("Answer \(session.name)'s question: \(a.label)")
                 }
             }
         }
@@ -1096,29 +1175,29 @@ struct ServiceRow: View {
     }
 
     @ViewBuilder var menu: some View {
-        if service.state == "stopped" {
-            Button("Start") { model.act(["start", service.name]) }
+        if session.state == .stopped {
+            Button("Start") { model.act(["start", session.name]) }
         } else {
-            Button("Open in terminal") { model.act(["open", service.name]) }
+            Button("Open in terminal") { model.act(["open", session.name]) }
         }
-        if service.managed {
+        if session.managed {
             Divider()
-            if service.state != "stopped" {
+            if session.state != .stopped {
                 Button("Restart") { confirming = .restart }
             }
             Button("Start fresh") { confirming = .fresh }
-            Button(service.autostart ? "Don't restore at login" : "Restore at login") {
-                model.act(["autostart", service.name, service.autostart ? "off" : "on"])
+            Button(session.autostart ? "Don't restore at login" : "Restore at login") {
+                model.act(["autostart", session.name, session.autostart ? "off" : "on"])
             }
         }
-        if service.state != "stopped" {
-            Button("Stop") { model.act(["stop", service.name]) }
+        if session.state != .stopped {
+            Button("Stop") { model.act(["stop", session.name]) }
         }
         Divider()
-        if service.managed {
-            Button("Stop tracking") { model.act(["rm", service.name]) }
+        if session.managed {
+            Button("Stop tracking") { model.act(["rm", session.name]) }
         } else {
-            Button("Track") { model.act(["snapshot", service.name]) }
+            Button("Track") { model.act(["snapshot", session.name]) }
         }
     }
 
@@ -1155,6 +1234,7 @@ struct SettingsView: View {
 struct GeneralPane: View {
     @EnvironmentObject var model: Model
     @AppStorage("alwaysShowRowButtons") private var alwaysShowButtons = false
+    @AppStorage(Model.restoreOnLaunchKey) private var restoreOnLaunch = true
     @State private var openAtLogin = SMAppService.mainApp.status == .enabled
     @State private var cliInstalled = false
 
@@ -1172,7 +1252,7 @@ struct GeneralPane: View {
                             openAtLogin = SMAppService.mainApp.status == .enabled
                         }
                     }
-                Toggle("Restore sessions after the Mac starts", isOn: model.$restoreOnLaunch)
+                Toggle("Restore sessions after the Mac starts", isOn: $restoreOnLaunch)
                     .help("The first time Tend opens after the Mac starts, start every tracked session that's set to restore. If you quit Tend or it crashes, your sessions keep running, and opening Tend again doesn't start or stop anything.")
             }
             Section("Panel") {
@@ -1193,11 +1273,15 @@ struct GeneralPane: View {
                     }
                 }
                 LabeledContent("Config") {
-                    Button("Open services.json") {
-                        NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser
-                            .appendingPathComponent(".config/tend/services.json"))
+                    if let path = model.configPaths?.config {
+                        let name = (path as NSString).lastPathComponent
+                        Button("Open \(name)") {
+                            if !NSWorkspace.shared.open(URL(fileURLWithPath: path)) {
+                                model.error = "Couldn't open \(path). Tend creates it when you track a session."
+                            }
+                        }
+                        .help("Open \(shortPath(path)), the list of tracked sessions, apps, and settings.")
                     }
-                    .help("Open ~/.config/tend/services.json, the list of tracked sessions.")
                 }
             }
         }
