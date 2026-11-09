@@ -927,9 +927,19 @@ struct ServiceRow: View {
             }
             .frame(width: 18, height: 18)
             .opacity(service.state == "stopped" ? 0.45 : 1)
+            // Cut a gap around the dot out of the icon, rather than drawing a
+            // ring, so the panel's material shows through.
+            .mask {
+                ZStack(alignment: .bottomTrailing) {
+                    Rectangle()
+                    Circle().frame(width: 10, height: 10)
+                        .offset(x: 3.5, y: 3.5)
+                        .blendMode(.destinationOut)
+                }
+                .compositingGroup()
+            }
             Circle().fill(badge)
                 .frame(width: 7, height: 7)
-                .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
                 .offset(x: 2, y: 2)
         }
         .help(stateHint)
