@@ -1,15 +1,16 @@
 # Tend: intent, design, and open threads
 
 This file records why Tend exists, what was decided while building it, and
-what's still open. It's the handoff from the session that built Tend in
-a personal automation project (November 4, 2026).
+what's still open. Tend started on November 4, 2026, as a script in a
+personal automation project, and became its own project soon after.
 
 ## Why Tend exists
 
-the user runs several Claude Code sessions as `claude rc` (Remote Control) inside
-detached tmux sessions, started with `rc-spawn`, so they can drive them from
-claude.ai/code or a phone. After a reboot, or when a session dies, they want
-them back: same folders, and ideally the same conversations.
+Tend is for someone who runs several Claude Code sessions as `claude rc`
+(Remote Control) inside detached tmux sessions, so they can drive each one
+from claude.ai/code or a phone. A small shell script started each session.
+After a reboot, or when a session dies, they want the sessions back: the same
+folders, and ideally the same conversations.
 
 The requirements grew in this order:
 
@@ -19,8 +20,8 @@ The requirements grew in this order:
    knows about Claude in particular.
 4. Generic app recognition: pick Claude from a list of apps, where an app can
    be any program, recognized by process parentage.
-5. A plus button that starts a new session, a generic `rc-spawn`.
-6. Tend as its own project (this folder).
+5. A plus button that starts a new session, replacing the shell script.
+6. Tend as its own project.
 
 The direction: a general tool for long-running, restorable terminal processes,
 with first-class support for programs (like Claude) that can tell Tend how to
@@ -59,12 +60,14 @@ it.
 Tend creates a detached tmux session with a login shell in `dir`, then types
 the command with `send-keys`. The shell loads the user's normal environment,
 and it stays open when the command exits, so the error stays readable. Tend
-shows that case as `exited`. This copies `rc-spawn`'s approach on purpose.
+shows that case as `exited`. This copies the original shell script's approach
+on purpose.
 
-Before Tend starts a session, it makes sure that the tmux server runs inside
-the `com.example.tmux-server` launch agent (the config's `tmux_launch_agent`), so
-that sessions created over ssh can still read the login keychain. That
-agent's source is in `~/Library/LaunchAgents/`.
+If the config sets `tmux_launch_agent`, Tend makes sure that the tmux server
+runs inside that launch agent before it starts a session, so that sessions
+created over ssh can still read the login keychain. Tend doesn't install the
+agent. The README has an example that runs `tmux -D` (the server in the
+foreground) with `KeepAlive`.
 
 ### Restoring once per boot
 
@@ -142,12 +145,12 @@ deliberate.
 
 ## Decisions and why
 
-- **Python standard library only** for the CLI, so it runs anywhere the user has
+- **Python standard library only** for the CLI, so it runs on any Mac with
   `python3`, including over ssh, with no install step.
 - **Typing the command into a shell** instead of `tmux new-session <cmd>`, for
   the user's environment and readable errors.
 - **Tooltips, not a hint line.** One version showed hover help in a line at
-  the bottom of the panel. the user preferred standard `.help` tooltips. Keep the
+  the bottom of the panel. Standard `.help` tooltips worked better. Keep the
   descriptive tooltip text.
 - **Apps are data, not code.** Claude's support is a profile in the same
   format that users write. A new program's support should be a profile first,
@@ -168,7 +171,10 @@ deliberate.
   in a real test, that came about 35 seconds after answering trust, while
   the pane already said "Connected". An app with no status field is ready
   once its command runs. `wait` allows 10 seconds for the shell to start
-  the command before it believes "exited".
+  the command before it believes "exited". When a service's command starts
+  a known app, `wait` also waits until it finds that app: a login shell runs
+  helper programs while it starts, and `wait` once took one of them for the
+  command and said "ready" while `claude` was failing.
 - **Setup runs once, outside the session.** `tend new --setup CMD` (or
   `--recipe ID --input TEXT`) runs in the folder before tend tracks the
   session, with the login shell's environment, so a failed clone shows its
@@ -187,8 +193,8 @@ deliberate.
 - **The panel is for sessions; settings have their own window.** Apps,
   Terminal, Accounts, startup, the command-line tool, and the config file
   are in a `Settings` scene, so they don't compete with the sessions.
-- **Rows keep their order.** the user didn't want sessions that need attention
-  moved to the top. Instead, a question shows as a card under its row, and
+- **Rows keep their order.** Moving sessions that need attention to the top
+  made rows jump around. Instead, a question shows as a card under its row, and
   errors and account problems show as banners at the top of the panel.
 - **Orange means "needs you."** Questions and account problems use it.
   Nothing else does: an exited session's badge is yellow.
@@ -202,6 +208,40 @@ deliberate.
 - **Action errors and refresh errors are separate.** An action's error stays
   until you close it or take another action. Before, the refresh that follows
   every action cleared it right away, so most action errors never showed.
+
+### Dropped conversations
+
+On Nov 7 the Mac rebooted, and every Remote Control chat lost its
+connection. tend restored each `claude rc` root, but the roots came back as
+new servers, and the Claude app showed the old chats as disconnected. Their
+background tasks died with the reboot, and their output, in `/tmp`, went
+with it. `tend resume` couldn't help: the server had deleted each chat's
+environment ("The environment this session was running on has been
+deleted"), and `claude remote-control --session-id` failed with a
+misleading "This folder is already served" error, however long it waited.
+The transcript was still on the Mac, under `~/.claude/projects/`.
+
+So:
+
+- **The root always comes back working.** If `tend resume` can't reattach,
+  it starts the service's usual command and puts the conversation on the
+  dropped list.
+- **Getting a chat back is a choice.** On each sync scan, tend records each
+  service's app process (PID and boot time) and its conversations, with the
+  profile's `recover` command filled in from each one's metadata, in
+  `state.json` (`live`). When the app comes back as a new process, its
+  conversations that don't run now go on the dropped list (`dropped`).
+  `tend recover NAME ID` starts a new service in the same folder that runs
+  the `recover` command, `claude --resume {sessionId} --remote-control`,
+  with autostart off, so a restore doesn't bring back a second copy of the
+  root. The app shows the list in a banner, with Recover and Dismiss.
+- **`tend stop` and `tend rm` forget a service's conversations**, because you
+  stopped it on purpose. A restart, a reboot, or a crash doesn't.
+- **A conversation that runs again comes off the list**, and the list shows a
+  conversation only after 30 seconds, because a plain restart reconnects one
+  a few seconds after the root starts. Entries expire after 7 days.
+- **Background tasks don't come back.** The recovered chat can see in its
+  transcript what it was running, so you ask it to start them again.
 
 ## Is tmux core?
 
@@ -227,33 +267,36 @@ in `bin/tend`.
 Untested, in rough order of risk:
 
 1. **How long Remote Control keeps its environment.** A plain `claude rc`
-   restart reconnected the last conversation a minute later. Whether it still
-   does after a night, or after a reboot, isn't confirmed. If the environment
-   has expired, the restart starts a new conversation, and the old one stays
-   in the app's history.
-2. **The plus button** starting a real `claude rc` session.
-3. **The app's UI** has been seen only as offscreen renders: the panel, the
+   restart reconnected the last conversation a minute later. A reboot is
+   different (see "Dropped conversations"). Whether a plain restart still
+   reconnects after a night, without a reboot, isn't confirmed.
+2. **`tend recover` with a real `claude`.** The dropped list, recover, and the
+   resume failover were tested only with a fake `claude` script on a scratch
+   tmux server. That `claude --resume ID --remote-control` reconnects a
+   Remote Control chat's transcript in the Claude app isn't confirmed.
+3. **The plus button** starting a real `claude rc` session.
+4. **The app's UI** has been seen only as offscreen renders: the panel, the
    new-session form, the question card, and the Settings panes, drawn from
    `NSHostingView` against a scratch config. Not seen in the real menu bar
    panel: hover (row buttons and highlight), the inline Restart confirmation,
    whether Settings comes to the front when opened from the panel, the
    keyboard shortcuts, and the folder pickers (`NSOpenPanel` from a menu bar
    panel can appear behind other windows).
-4. **Open in terminal** (iTerm through AppleScript) from inside a tend
+5. **Open in terminal** (iTerm through AppleScript) from inside a tend
    session fails with "Not authorized to send Apple events to iTerm
-   (-1743)". The tmux server is started by the `com.example.tmux-server` launch
-   agent, so macOS sees `/opt/homebrew/bin/tmux`, a background program, as
+   (-1743)". When a launch agent starts the tmux server (see
+   `tmux_launch_agent`), macOS sees `/opt/homebrew/bin/tmux`, a background program, as
    the sender. It can't show an Allow prompt for that, so it denies, and
    `tccutil reset` doesn't help. `tend open` works from an iTerm window and
    from the app. A fix: when `tend open` runs inside tmux, hand the request
    to Tend.app, which has the permission.
-5. **Open at login** through `SMAppService` with an ad hoc signed app.
-6. **A renamed folder strands its session.** When `~/Projects/app`
-   was renamed to `app-ios`, the session kept running (processes follow
+6. **Open at login** through `SMAppService` with an ad hoc signed app.
+7. **A renamed folder strands its session.** When a project folder was
+   renamed, from `app` to `app-ios`, its session kept running (processes follow
    the rename), but its tracked `dir` pointed at a folder that no longer
    existed, so a restart or restore would fail. `tend ls` could flag a
    tracked `dir` that's missing.
-7. **Remote Control entries outlive their process.** After a test
+8. **Remote Control entries outlive their process.** After a test
    `claude rc` stops, its environment stays in the Claude app and at
    claude.ai/code as disconnected for a while, and `claude rc` has no command
    to remove it. A session stopped minutes earlier can still show as
@@ -264,6 +307,6 @@ Ideas raised but not built:
 - A `launchd` runner (see above).
 - UI for app metadata and resume templates. Today, only the config file can
   set them for custom apps.
-- `rc-spawn` (in the automation project) could become a thin wrapper around
-  `tend new claude`. Today it starts the session itself and then registers it
-  with `tend add`.
+- An existing launcher script can become a thin wrapper around
+  `tend new claude`, instead of starting the session itself and then
+  registering it with `tend add`.

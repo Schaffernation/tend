@@ -13,7 +13,7 @@ flag, run `tend --help`.
 
 Route by the request. With arguments, the first word picks the branch: `new`
 starts a session, `help` shows the menu, and any other `tend` command (`ls`,
-`open`, `stop`, `restart`, `start`, `history`, `resume`, `snapshot`,
+`open`, `stop`, `restart`, `start`, `history`, `resume`, `dropped`, `recover`, `snapshot`,
 `autostart`, `rm`) runs under
 **Manage sessions**. With no arguments and no request, or when the user asks
 what this can do, show the menu.
@@ -125,5 +125,13 @@ When a restart started a new conversation instead of reconnecting (Remote
 Control forgets after a while), `tend resume NAME [ID]` brings back the
 latest one, or the given ID, in single-session mode. A later
 `tend restart NAME` returns it to server mode and keeps the conversation.
+
+After a reboot, Remote Control can't reattach to a chat at all. Then
+`tend resume` starts the session the usual way and lists the chat under
+`tend dropped`. Chats a restart or reboot cut off land there too, for 7 days.
+`tend recover NAME ID` reopens one in a new session in the same folder,
+connected to the Claude app, with autostart off. Tell the user the chat's
+background tasks didn't survive, so they may want to ask it to start them
+again. `tend dismiss NAME ID` (or `--all`) clears the list.
 
 `tend rm NAME` stops tracking a session and leaves it running.

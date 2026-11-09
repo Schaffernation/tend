@@ -127,6 +127,15 @@ struct Accounts: Decodable {
     let available: [Available]
 }
 
+/// A conversation that was dropped when its session restarted, from
+/// `tend dropped --json` with snake-case keys converted.
+struct DroppedChat: Decodable, Identifiable, Hashable {
+    let service: String
+    let id: String
+    let label: String?
+    let droppedAt: Int
+}
+
 struct Service: Decodable, Identifiable, Hashable {
     let name: String
     let dir: String
@@ -152,6 +161,7 @@ final class Model: ObservableObject {
     @Published var recipes: [Recipe] = []
     @Published var terminal: TerminalSettings?
     @Published var accounts: Accounts?
+    @Published var dropped: [DroppedChat] = []
 
     /// When each watched account's problem started, and which problems Tend
     /// has already posted a notification for.
@@ -278,7 +288,8 @@ final class Model: ObservableObject {
 
     func refresh() async {
         var outputs: [Data] = []
-        for args in [["ls", "--json"], ["apps", "--json"], ["accounts", "--json"], ["recipes", "--json"]] {
+        for args in [["ls", "--json"], ["apps", "--json"], ["accounts", "--json"], ["recipes", "--json"],
+                     ["dropped", "--json"]] {
             let result = await call(args)
             guard let data = result.data else {
                 refreshError = result.error
@@ -293,6 +304,7 @@ final class Model: ObservableObject {
             snake.keyDecodingStrategy = .convertFromSnakeCase
             accounts = try snake.decode(Accounts.self, from: outputs[2])
             recipes = try JSONDecoder().decode([Recipe].self, from: outputs[3])
+            dropped = try snake.decode([DroppedChat].self, from: outputs[4])
             checkAccounts()
             refreshError = nil
         } catch {
@@ -543,6 +555,7 @@ struct ContentView: View {
 
     @ViewBuilder var messages: some View {
         let any = model.refreshError != nil || model.error != nil || !model.accountProblems.isEmpty
+            || !model.dropped.isEmpty
         if any {
             VStack(alignment: .leading, spacing: 6) {
                 if let problem = model.refreshError {
@@ -553,6 +566,7 @@ struct ContentView: View {
                     Banner(text: error, systemImage: "xmark.octagon.fill", tint: .red,
                            help: "The last action failed.") { model.error = nil }
                 }
+                if !model.dropped.isEmpty { DroppedBanner(chats: model.dropped) }
                 ForEach(model.accountProblems) { account in
                     Banner(text: account.problem ?? "\(account.name) needs attention.",
                            systemImage: "person.crop.circle.badge.exclamationmark", tint: .orange,
@@ -619,6 +633,62 @@ struct Banner: View {
         .padding(8)
         .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
         .help(help)
+    }
+}
+
+/// Conversations that lost their connection when their session restarted,
+/// as Claude Remote Control chats do after a reboot, with a way back.
+struct DroppedBanner: View {
+    @EnvironmentObject var model: Model
+    let chats: [DroppedChat]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "bubble.left.and.exclamationmark.bubble.right.fill")
+                    .foregroundStyle(.orange)
+                Text(chats.count == 1
+                     ? "A chat lost its connection when its session restarted."
+                     : "\(chats.count) chats lost their connection when their sessions restarted.")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if chats.count > 1 {
+                    Button("Dismiss all") { model.act(["dismiss", "--all"]) }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                        .foregroundStyle(.secondary)
+                        .help("Take every chat off this list. Their conversations stay on this Mac.")
+                }
+            }
+            ForEach(chats) { chat in
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(chat.label ?? chat.id).lineLimit(1)
+                        Text("\(chat.service) · \(ago(chat.droppedAt))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .help(chat.id)
+                    Spacer(minLength: 8)
+                    Button("Recover") { model.act(["recover", chat.service, chat.id]) }
+                        .controlSize(.small)
+                        .help("Reopen this conversation in a new session in the same folder, connected to the Claude app. Tasks it was running in the background don't come back, so ask it to start them again.")
+                    Button { model.act(["dismiss", chat.service, chat.id]) } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                        .help("Take this chat off the list. Its conversation stays on this Mac.")
+                }
+                .padding(.leading, 24)
+            }
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    func ago(_ t: Int) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .full
+        return f.localizedString(for: Date(timeIntervalSince1970: TimeInterval(t)), relativeTo: Date())
     }
 }
 

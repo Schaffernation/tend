@@ -1,0 +1,46 @@
+name: Bug report
+description: Something in Tend doesn't work the way the docs say it does.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, or what you clicked in the app.
+      placeholder: |
+        1. tend new --dir /tmp/demo -- sleep 600
+        2. tend restart demo
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The output of `tend ls`, and any error message. Remove anything private, like folder names.
+      render: text
+  - type: input
+    id: tend-version
+    attributes:
+      label: Tend version
+      description: The release you downloaded, like 0.1. If you built from source, run `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: macOS, tmux, and Python versions
+      description: Run `sw_vers -productVersion; tmux -V; python3 --version`.
+    validations:
+      required: true
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Code version, if the problem involves Claude
+      description: Run `claude --version`.

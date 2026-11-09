@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest something Tend could do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you're trying to do
+      description: The situation and the problem, not only the solution you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you'd like Tend to do
+  - type: textarea
+    id: program
+    attributes:
+      label: If this is about a specific program
+      description: Support for a program usually starts as an app profile. If you tried to write one, paste it here, and say what it couldn't express.
+      render: json

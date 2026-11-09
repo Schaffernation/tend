@@ -51,7 +51,17 @@ Usage:
                                    by default, after Remote Control has
                                    forgotten it. It runs in single-session
                                    mode; a later restart returns to server
-                                   mode and keeps it.
+                                   mode and keeps it. If it can't come back,
+                                   as after a reboot, tend starts the session
+                                   the usual way and lists the conversation
+                                   under `tend dropped`.
+  tend dropped [--json]            List conversations that were dropped when
+                                   their session restarted, as Remote Control
+                                   chats are after a reboot.
+  tend recover NAME ID [--as N]    Reopen a dropped conversation in a new
+                                   session that tend doesn't autostart. Its
+                                   background tasks don't come back.
+  tend dismiss NAME ID | --all     Take conversations off the dropped list.
   tend restore [--once]            Start every autostart service that isn't running.
                                    With --once, do nothing if tend already
                                    restored since the Mac started.
@@ -210,15 +220,99 @@ def record_history(seen):
         for c in convs:
             e = next((e for e in entries if e["id"] == c["id"]), None)
             if e is None:
-                entries.append({"id": c["id"], "label": c["label"], "first_seen": now, "last_seen": now})
+                entries.append({"id": c["id"], "label": c["label"], "recover": c.get("recover"),
+                                "first_seen": now, "last_seen": now})
                 changed = True
-            elif now - e["last_seen"] >= HISTORY_REFRESH or e.get("label") != c["label"]:
-                e.update(label=c["label"], last_seen=now)
+            elif (now - e["last_seen"] >= HISTORY_REFRESH or e.get("label") != c["label"]
+                  or e.get("recover") != c.get("recover")):
+                e.update(label=c["label"], recover=c.get("recover"), last_seen=now)
                 changed = True
         entries.sort(key=lambda e: -e["last_seen"])
         del entries[HISTORY_LIMIT:]
     if changed:
         save_state(state)
+
+
+# How long tend lists a dropped conversation, in seconds.
+DROPPED_KEEP = 7 * 86400
+
+
+def track_live(seen):
+    """Notice conversations that were dropped when their session restarted.
+
+    `seen` is {service: {pid, dir, chats}} for each running service with an
+    app. tend remembers the app's process and its conversations. When a
+    service's app comes back as a new process, a conversation that ran under
+    the old one and doesn't run now was dropped: it goes on the dropped list,
+    with the command that recovers it. A dropped conversation that runs
+    again, anywhere, comes off the list.
+    """
+    state = load_state()
+    before = json.dumps(state, sort_keys=True)
+    live = state.setdefault("live", {})
+    dropped = state.setdefault("dropped", [])
+    boot, now = boot_time(), int(time.time())
+    for name, cur in seen.items():
+        prev = live.get(name)
+        if prev and (prev.get("pid"), prev.get("boot")) != (cur["pid"], boot):
+            ids = {c["id"] for c in cur["chats"]}
+            for c in prev.get("chats", []):
+                if c["id"] in ids or not c.get("recover") or any(d["id"] == c["id"] for d in dropped):
+                    continue
+                dropped.append({"service": name, "dir": prev.get("dir") or cur["dir"], "id": c["id"],
+                                "label": c.get("label"), "recover": c["recover"], "dropped_at": now})
+        live[name] = {"pid": cur["pid"], "boot": boot, "dir": cur["dir"], "chats": cur["chats"]}
+    running = {c["id"] for cur in seen.values() for c in cur["chats"]}
+    dropped[:] = [d for d in dropped if d["id"] not in running and now - d["dropped_at"] < DROPPED_KEEP]
+    if json.dumps(state, sort_keys=True) != before:
+        save_state(state)
+
+
+def forget_live(name):
+    """After you stop a session yourself, its conversations don't count as dropped."""
+    state = load_state()
+    if state.get("live", {}).pop(name, None) is not None:
+        save_state(state)
+
+
+# A plain restart reconnects a conversation a few seconds after the app
+# starts, so tend shows a dropped conversation only after this many seconds.
+DROPPED_SETTLE = 30
+
+
+def dropped_list(settled=True):
+    now = int(time.time())
+    return [
+        d for d in load_state().get("dropped", [])
+        if now - d["dropped_at"] < DROPPED_KEEP and (not settled or now - d["dropped_at"] >= DROPPED_SETTLE)
+    ]
+
+
+def drop_conversation(name, entry, now=None):
+    """Put a conversation from a service's history on the dropped list."""
+    if not entry.get("recover"):
+        return False
+    state = load_state()
+    dropped = state.setdefault("dropped", [])
+    if any(d["id"] == entry["id"] for d in dropped):
+        return True
+    s_dir = next((s["dir"] for s in load()["services"] if s["name"] == name), None)
+    dropped.append({"service": name, "dir": s_dir, "id": entry["id"], "label": entry.get("label"),
+                    "recover": entry["recover"], "dropped_at": now or int(time.time())})
+    save_state(state)
+    return True
+
+
+def dismiss(name=None, conv=None):
+    """Take conversations off the dropped list: one, or all with no ID."""
+    state = load_state()
+    dropped = state.get("dropped", [])
+    keep = [d for d in dropped if conv and not (d["id"] == conv and (not name or d["service"] == name))]
+    if len(keep) == len(dropped):
+        raise TendError(f"no dropped conversation {conv}." if conv else "no dropped conversations.")
+    state["dropped"] = keep
+    save_state(state)
+    return len(dropped) - len(keep)
 
 
 def find(cfg, name):
@@ -393,6 +487,10 @@ def exe_path(pid, _cache={}):
 #                instance, like `claude rc`.
 #   reattach     Optional. The command `tend resume` runs to bring back a
 #                past conversation, with {id} from metadata `id_field`.
+#   recover      Optional. The command `tend recover` runs, in a new
+#                session, to bring back a conversation that was dropped when
+#                its session restarted. Filled in from that conversation's
+#                metadata, like `resume`.
 #   release_wait Optional. After tend stops a process started with one of
 #                `args`, it waits `seconds` before starting the app again in
 #                that folder, so the old one can let go of it.
@@ -436,13 +534,17 @@ BUILTIN_APPS = [
                 # in single-session mode, which turns that off.
                 "resume": "{command}",
             },
-            {"id": "interactive", "resume": "claude --resume {sessionId}"},
+            {"id": "interactive", "resume": "{command} --resume {sessionId}"},
         ],
         "launch": "claude rc",
         # Brings a conversation back after Remote Control has forgotten it,
         # in single-session mode. A later plain restart returns to server
         # mode and keeps the conversation.
         "reattach": "claude remote-control --session-id {id}",
+        # Reopens a conversation from its transcript on this Mac and connects
+        # it to the Claude app. This works after a reboot, when Remote
+        # Control can no longer reattach to it.
+        "recover": "claude --resume {sessionId} --remote-control",
         "release_wait": {"args": ["--session-id", "-c", "--continue"], "seconds": 45},
         "preflight": "claude-trust",
         "questions": [
@@ -560,6 +662,12 @@ def describe(app, proc, pids, metadata):
             resume = mode["resume"].format_map({**m, "command": shlex.join(base)})
         except (KeyError, IndexError, ValueError):
             pass
+
+    def recover(d):
+        try:
+            return app["recover"].format_map(d) if app.get("recover") else None
+        except (KeyError, IndexError, ValueError):
+            return None
     return {
         "id": app["id"],
         "name": app.get("name", app["id"]),
@@ -573,7 +681,7 @@ def describe(app, proc, pids, metadata):
         "pid": proc["pid"],
         "args": a,
         "conversations": [
-            {"id": d[md["id_field"]], "label": d.get(md.get("label_field", ""))}
+            {"id": d[md["id_field"]], "label": d.get(md.get("label_field", "")), "recover": recover(d)}
             for d in meta
             if md.get("id_field") and d.get(md["id_field"])
         ],
@@ -659,7 +767,7 @@ def status(cfg, sync=True):
     procs, children = process_table()
     app_list = [a for a in apps(cfg) if a["enabled"]]
     metadata = {a["id"]: read_metadata(a) for a in app_list}
-    rows, changed, conversations = [], False, {}
+    rows, changed, conversations, live = [], False, {}, {}
 
     seen = set()
     for s in cfg["services"]:
@@ -680,6 +788,9 @@ def status(cfg, sync=True):
             row.update(state=info["state"], attached=info["attached"], app=info["app"])
             if sync and info["app"] and info["app"]["conversations"]:
                 conversations[s["name"]] = info["app"]["conversations"]
+            if sync and info["app"]:
+                live[s["name"]] = {"pid": info["app"]["pid"], "dir": s["dir"],
+                                   "chats": info["app"]["conversations"]}
             resume = info["app"] and info["app"]["resume"]
             if sync and resume and resume != s.get("resume"):
                 s["resume"] = row["resume"] = resume
@@ -707,6 +818,8 @@ def status(cfg, sync=True):
     if changed:
         save(cfg)
     record_history(conversations)
+    if sync:
+        track_live(live)
     return rows
 
 
@@ -812,23 +925,51 @@ def recipes_command(cfg, a):
     print(f"Removed recipe '{a.target}'.")
 
 
-def wait(cfg, name, timeout):
-    """Wait for a session to settle. Return (exit status, message)."""
+def expected_app(cfg, command):
+    """The app a command starts, by the name of its program, or None."""
+    a = argv(command or "")
+    prog = os.path.basename(a[0]) if a else ""
+    return next((x for x in apps(cfg) if x["enabled"] and prog in x.get("match", {}).get("names", [])), None)
+
+
+def pane_tail(name, n=3):
+    """The last lines a session's pane shows, for an error message."""
+    r = tmux("capture-pane", "-p", "-J", "-t", f"={name}:", check=False)
+    lines = [l.rstrip() for l in r.stdout.splitlines() if l.strip()] if r.returncode == 0 else []
+    return "\n".join(lines[-n:])
+
+
+def wait(cfg, name, timeout, command=None):
+    """Wait for a session to settle. Return (exit status, message).
+
+    If the session's command starts an app, like `claude`, the session
+    isn't ready until tend finds that app: while a login shell starts, it
+    runs helper programs that would otherwise look like the command.
+    """
     began = time.monotonic()
     deadline = began + timeout
+    s = find(cfg, name)
+    expect = expected_app(cfg, command or (s and s.get("command")))
     seen_running = False
     while True:
         row = next((r for r in status(cfg, sync=False) if r["name"] == name), None)
         if not row:
             raise TendError(f"no session named '{name}'.")
         c = row["app"]
-        seen_running = seen_running or row["state"] == "running"
+        if expect:
+            seen_running = seen_running or bool(c and c["id"] == expect["id"])
+        else:
+            seen_running = seen_running or row["state"] == "running"
         # Right after a start, the shell may not have run the command yet.
-        if row["state"] == "exited" and not seen_running and time.monotonic() - began < 10:
+        if not seen_running and time.monotonic() - began < 10 and (
+            row["state"] == "exited" or (expect and row["state"] == "running")
+        ):
             time.sleep(1)
             continue
-        if row["state"] != "running":
-            return 1, f"'{name}' isn't running: its command {'exited' if row['state'] == 'exited' else 'stopped'}."
+        if row["state"] != "running" or (expect and not c and not seen_running):
+            what = "exited" if row["state"] != "stopped" else "stopped"
+            tail = pane_tail(name) if row["state"] != "stopped" else ""
+            return 1, f"'{name}' isn't running: its command {what}." + (f"\n{tail}" if tail else "")
         if c and c.get("question"):
             q = c["question"]
             ids = "|".join(x["id"] for x in q["answers"])
@@ -1287,6 +1428,19 @@ def main():
     sp.add_argument("--input", help="for add: a label for the text {input} stands for")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("dropped", help="list conversations dropped when their session restarted")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("recover", help="reopen a dropped conversation in a new session")
+    sp.add_argument("name", help="the service the conversation ran in")
+    sp.add_argument("id", help="a conversation ID from `tend dropped`")
+    sp.add_argument("--as", dest="as_name", help="a name for the new session (default: the conversation's)")
+
+    sp = sub.add_parser("dismiss", help="take a conversation off the dropped list")
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("id", nargs="?")
+    sp.add_argument("--all", action="store_true", help="dismiss every dropped conversation")
+
     sp = sub.add_parser("wait", help="wait until a session is ready, asks a question, or exits")
     sp.add_argument("name")
     sp.add_argument("--timeout", type=int, default=90, help="seconds to wait (default 90)")
@@ -1441,6 +1595,7 @@ def main():
             print(stop(a.name))
         cfg["services"] = [s for s in cfg["services"] if s["name"] != a.name]
         save(cfg)
+        forget_live(a.name)
         print(f"Stopped tracking '{a.name}'.")
 
     elif a.cmd == "start":
@@ -1448,6 +1603,7 @@ def main():
 
     elif a.cmd == "stop":
         print(stop(a.name))
+        forget_live(a.name)
 
     elif a.cmd == "restart":
         s = need(cfg, a.name)
@@ -1493,7 +1649,55 @@ def main():
             out = stop_for_restart(cfg, a.name)
             if out:
                 print(out)
-        print(start(cfg, s, command=app["reattach"].format(id=conv)))
+        cmd = app["reattach"].format(id=conv)
+        print(start(cfg, s, command=cmd))
+        sys.stdout.flush()
+        code, message = wait(cfg, a.name, 60, command=cmd)
+        if code == 1 and s.get("command"):
+            # Remote Control can't reattach to a conversation whose
+            # environment is gone, as after a reboot. Start the session the
+            # usual way, and offer the conversation to recover.
+            print(f"tend: couldn't bring back {conv}.\n{message}", file=sys.stderr)
+            tmux("send-keys", "-t", f"={a.name}:", "-l", "--", s["command"])
+            tmux("send-keys", "-t", f"={a.name}:", "Enter")
+            print(f"Started '{a.name}' again: {s['command']}")
+            entry = next((e for e in entries if e["id"] == conv), {"id": conv})
+            if drop_conversation(a.name, entry):
+                print(f"To reopen the conversation in its own session, run `tend recover {a.name} {conv}`.")
+
+    elif a.cmd == "dropped":
+        entries = dropped_list()
+        if a.json:
+            json.dump(entries, sys.stdout, indent=2)
+            print()
+        elif not entries:
+            print("No dropped conversations.")
+        else:
+            for d in entries:
+                print(f"{d['service']:<16} {d['id']}  {ago(d['dropped_at']):>16}  {d.get('label') or ''}")
+
+    elif a.cmd == "recover":
+        entry = next((d for d in dropped_list(settled=False) if d["id"] == a.id and d["service"] == a.name), None)
+        entry = entry or next((e for e in history_for(a.name) if e["id"] == a.id and e.get("recover")), None)
+        if not entry:
+            raise TendError(f"'{a.name}' has no dropped conversation {a.id}. Run `tend dropped` to see them.")
+        d = entry.get("dir") or need(cfg, a.name)["dir"]
+        name = unique_name(cfg, session_name(a.as_name or entry.get("label") or f"{a.name}-chat"))
+        s = {"name": name, "dir": d, "command": entry["recover"], "autostart": False}
+        cfg["services"].append(s)
+        save(cfg)
+        print(start(cfg, s))
+        try:
+            dismiss(a.name, a.id)
+        except TendError:
+            pass
+        print(f"'{name}' doesn't start when tend restores sessions. Turn that on with `tend autostart {name} on`.")
+
+    elif a.cmd == "dismiss":
+        if not a.all and not a.id:
+            raise TendError("give a conversation ID, or --all.")
+        n = dismiss(a.name if not a.all else None, None if a.all else a.id)
+        print(f"Dismissed {n} dropped conversation{'s' if n != 1 else ''}.")
 
     elif a.cmd == "restore":
         if a.once and restored_this_boot():
