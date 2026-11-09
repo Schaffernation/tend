@@ -36,17 +36,23 @@ Two parts. All behavior lives in the CLI; the app is a thin client.
   restore. It must keep working over ssh, with no GUI.
 - **`app/Tend.swift`** is a SwiftUI `MenuBarExtra` app, built with plain
   `swiftc` (no Xcode project). It runs its bundled copy of `tend ... --json` and
-  renders the result. It polls `tend ls --json` and `tend apps --json` every
-  5 seconds.
+  renders the result. Every 5 seconds it polls what changes on its own
+  (`ls`, `accounts`, and `dropped`). It loads apps, recipes, terminal
+  settings, and the config path when it opens and after an action that
+  changes them. It asks `tend folders` for the new-session form's
+  suggestions, rather than listing folders itself.
 
 Keep this split: new behavior goes in the CLI first, and then the app exposes
 it.
 
 ### Core concepts
 
-- **Service**: a tracked tmux session. Fields: `name`, `dir`, `command` (what
+- **Session**: a tracked tmux session. Fields: `name`, `dir`, `command` (what
   a fresh start types), `resume` (what a restore types, saved automatically),
-  and `autostart`. Stored in `~/.config/tend/services.json`.
+  and `autostart`. Stored in `~/.config/tend/sessions.json`. Earlier versions
+  called these services and stored them in `services.json`, under a
+  `services` key; tend still reads that file and key, and writes back the key
+  the file used.
 - **App**: a profile that tells Tend how to recognize a program and,
   optionally, how to read its state and resume it. Claude is the only built-in
   app (`BUILTIN_APPS` in `bin/tend`). The comment block above
@@ -107,8 +113,9 @@ Each status check (`tend ls`) combines three sources:
    and the IDs that its resume templates need.
 
 `tend ls` also saves the current resume command for each running tracked
-service, so a restore uses the latest conversation. That side effect is
-deliberate.
+session, so a restore uses the latest conversation. That side effect is
+deliberate, and lives in `sync()`: `status()` itself only reads, so `wait`,
+`answer`, and `folders` can scan without writing anything.
 
 ### Claude specifics
 
@@ -121,7 +128,7 @@ deliberate.
   works for about 4 hours.
 - Remote Control forgets an environment after a while, and then a plain
   restart starts a new conversation. So tend records every conversation ID it
-  sees in `state.json` (`history`, the last 20 per service), and
+  sees in `state.json` (`history`, the last 20 per session), and
   `tend resume` brings one back with `--session-id`, in single-session mode.
   A later plain restart returns to server mode and keeps the conversation.
 - After a single-session process stops, Remote Control needs about 45
@@ -145,6 +152,12 @@ deliberate.
 
 ## Decisions and why
 
+- **Every change to a file happens under a lock.** The app runs `tend ls`
+  every 5 seconds, and `ls` saves resume commands. Without a lock, an `ls`
+  that loaded the config before a `tend new` saved could write its older
+  copy back, and the new session would disappear. `edit_config()` and
+  `edit_state()` take an `flock` on `.tend.lock`, load the file fresh, and
+  save it. `tests/test_tend.py` checks this with concurrent writers.
 - **Python standard library only** for the CLI, so it runs on any Mac with
   `python3`, including over ssh, with no install step.
 - **Typing the command into a shell** instead of `tmux new-session <cmd>`, for
@@ -171,7 +184,7 @@ deliberate.
   in a real test, that came about 35 seconds after answering trust, while
   the pane already said "Connected". An app with no status field is ready
   once its command runs. `wait` allows 10 seconds for the shell to start
-  the command before it believes "exited". When a service's command starts
+  the command before it believes "exited". When a session's command starts
   a known app, `wait` also waits until it finds that app: a login shell runs
   helper programs while it starts, and `wait` once took one of them for the
   command and said "ready" while `claude` was failing.
@@ -224,18 +237,18 @@ The transcript was still on the Mac, under `~/.claude/projects/`.
 So:
 
 - **The root always comes back working.** If `tend resume` can't reattach,
-  it starts the service's usual command and puts the conversation on the
+  it starts the session's usual command and puts the conversation on the
   dropped list.
 - **Getting a chat back is a choice.** On each sync scan, tend records each
-  service's app process (PID and boot time) and its conversations, with the
+  session's app process (PID and boot time) and its conversations, with the
   profile's `recover` command filled in from each one's metadata, in
   `state.json` (`live`). When the app comes back as a new process, its
   conversations that don't run now go on the dropped list (`dropped`).
-  `tend recover NAME ID` starts a new service in the same folder that runs
+  `tend recover NAME ID` starts a new session in the same folder that runs
   the `recover` command, `claude --resume {sessionId} --remote-control`,
   with autostart off, so a restore doesn't bring back a second copy of the
   root. The app shows the list in a banner, with Recover and Dismiss.
-- **`tend stop` and `tend rm` forget a service's conversations**, because you
+- **`tend stop` and `tend rm` forget a session's conversations**, because you
   stopped it on purpose. A restart, a reboot, or a crash doesn't.
 - **A conversation that runs again comes off the list**, and the list shows a
   conversation only after 30 seconds, because a plain restart reconnects one

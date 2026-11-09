@@ -72,5 +72,10 @@ what's untested). `CONTRIBUTING.md` covers setup and the pull request process.
   test `questions` and `tend answer`, use a fake `claude` script on a scratch
   tmux server instead: `printf 'Trust %s? [y/N] ' "$PWD"; read a`. tend
   matches it by the script's name.
-- `tend ls` saves resume commands as a side effect. Use `status(cfg, sync=False)`
-  when you need a read-only scan.
+- `tend ls` saves resume commands as a side effect, through `sync()`.
+  `status()` only reads, so use it alone when you need a read-only scan.
+- Change the config or state only inside `edit_config()` or `edit_state()`,
+  which hold the lock and reload the file. Saving a config you loaded earlier
+  can overwrite another process's change.
+- Run the tests with `python3 -m unittest discover tests`. They use their own
+  tmux server and config, so they don't touch real sessions.

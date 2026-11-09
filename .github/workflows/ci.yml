@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test the CLI on Python ${{ matrix.python }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is what the Xcode Command Line Tools ship.
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install tmux
+        run: brew install tmux
+      - name: Run the tests
+        run: python -m unittest discover tests -v
+
+  build:
+    name: Build the app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build without installing
+        # Without a Developer ID certificate, build.sh signs ad hoc.
+        run: app/build.sh --no-install

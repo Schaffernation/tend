@@ -92,6 +92,27 @@ enough to test `tend answer`:
 printf 'Trust %s? [y/N] ' "$PWD"; read a
 ```
 
+## Run the tests
+
+From the repository root, run:
+
+```
+python3 -m unittest discover tests
+```
+
+The tests need only Python. The end-to-end tests also need tmux. They start
+their own tmux server in a folder under `/tmp` and stop it when they finish,
+so they don't touch your sessions, even if you run them inside tmux. Without
+tmux, they're skipped.
+
+Add a test with each change to `bin/tend`. Keep logic that doesn't need tmux,
+like parsing or matching, in functions that take plain data, so a unit test
+can call them directly.
+
+When you change the config or state, do it inside `edit_config()` or
+`edit_state()`. They hold a lock and reload the file, so a change that the
+menu bar app's poll saved in the meantime isn't lost.
+
 ## Build
 
 After you change `app/` or `bin/tend`, run `app/build.sh --no-install`. The
@@ -118,7 +139,9 @@ text goes in `.help` tooltips.
    `skills/tend/SKILL.md`. If you change a decision recorded in
    `docs/intent.md`, update it too.
 4. Add an entry under **Unreleased** in [CHANGELOG.md](CHANGELOG.md).
-5. In the description, say how you tested the change.
+5. Run the tests. GitHub Actions runs them, and builds the app, on every
+   pull request.
+6. In the description, say how you tested the change.
 
 By contributing, you agree that your contributions are licensed under the
 [MIT License](LICENSE).

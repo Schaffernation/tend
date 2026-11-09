@@ -5,7 +5,39 @@ This file lists the changes in each release of Tend. Versions follow
 
 ## Unreleased
 
-- Added a license (MIT), contributing guide, and security policy.
+### Added
+
+- `tend dropped`, `tend recover`, and `tend dismiss`: list the conversations
+  a restart dropped, like Remote Control chats after a reboot, and reopen one
+  in its own session. The app shows them in a banner.
+- `tend config` shows where Tend keeps its files.
+- Tests (`python3 -m unittest discover tests`) and a GitHub Actions workflow
+  that runs them and builds the app.
+- A license (MIT), contributing guide, and security policy.
+
+### Changed
+
+- Tend calls tracked tmux sessions "sessions" everywhere. A new config file is
+  named `sessions.json`. An existing `services.json` keeps working.
+- tend adds Homebrew and `~/.local/bin` to the end of your `PATH` instead of
+  replacing it, so your own tools come first.
+- The app polls only what changes on its own, and asks `tend folders` for
+  folder suggestions.
+
+### Fixed
+
+- Two Tend commands that changed the config at the same time, like the app's
+  poll and `tend new`, could lose one of the changes. Changes now happen
+  under a lock.
+- `tend open` failed for a session whose name had a character outside ASCII,
+  like `café`.
+- A config file with a JSON error printed a Python traceback. tend now says
+  where the error is.
+- A tmux session started with a command instead of a shell showed as exited,
+  and `tend snapshot` saved it as a plain shell.
+- The **Restore sessions after the Mac starts** setting could show the wrong
+  value in Settings.
+- An app installed after Tend opened showed no icon until Tend restarted.
 
 ## 0.1
 

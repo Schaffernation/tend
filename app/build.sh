@@ -12,7 +12,9 @@
 # certificate is in your keychain, and ad hoc otherwise. A Developer ID
 # signature stays the same across builds, so macOS keeps each account's
 # notification and automation permissions. Set TEND_SIGN_IDENTITY to choose a
-# certificate; otherwise a SchafferNation LLC certificate wins over others.
+# certificate. Otherwise, the first Developer ID Application certificate that
+# matches TEND_SIGN_PREFER wins (by default, the maintainer's, SchafferNation),
+# and then the first one in your keychain.
 
 emulate -L zsh
 setopt err_exit no_unset
@@ -45,7 +47,7 @@ done
 lipo -create -output $app/Contents/MacOS/Tend $build/arch/Tend-arm64 $build/arch/Tend-x86_64
 
 identities=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2}')
-identity=${TEND_SIGN_IDENTITY:-$(print -r -- $identities | grep -i schaffernation | head -1)}
+identity=${TEND_SIGN_IDENTITY:-$(print -r -- $identities | grep -i -- "${TEND_SIGN_PREFER:-schaffernation}" | head -1)}
 identity=${identity:-$(print -r -- $identities | head -1)}
 if [[ -n $identity ]]; then
   codesign --force --options runtime --timestamp \

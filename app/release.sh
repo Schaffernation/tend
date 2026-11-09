@@ -10,6 +10,11 @@
 #   xcrun notarytool store-credentials tend-notary \
 #     --apple-id YOUR_APPLE_ID --team-id YOUR_TEAM_ID
 #
+# Your team ID is the 10 characters in parentheses at the end of your
+# certificate's name. To see it, run:
+#
+#   security find-identity -v -p codesigning
+#
 # Set TEND_NOTARY_PROFILE to use a different keychain profile name.
 
 emulate -L zsh

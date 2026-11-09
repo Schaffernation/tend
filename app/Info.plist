@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!-- If you release your own build of Tend, change this to an identifier
+       you own, like com.example.tend. -->
   <key>CFBundleIdentifier</key>
   <string>com.schaffernation.tend</string>
   <key>CFBundleName</key>

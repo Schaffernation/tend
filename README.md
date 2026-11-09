@@ -101,7 +101,8 @@ app, for example on a Mac you reach over ssh, run:
 tend restore
 ```
 
-For every command, run `tend --help`.
+For every command, run `tend --help`. To see where Tend keeps its files, run
+`tend config`.
 
 ## Claude Code
 
@@ -266,8 +267,11 @@ read anything in the other account.
 
 Tend keeps its files in `~/.config/tend`:
 
-- `services.json` holds your sessions, apps, recipes, and settings. You can
-  edit it. To use a different file, set `TEND_CONFIG` to its path.
+- `sessions.json` holds your sessions, apps, recipes, and settings. You can
+  edit it. To use a different file, set `TEND_CONFIG` to its path. If you
+  used an earlier version of Tend, your file is named `services.json`, and
+  Tend keeps using it.
+- `.tend.lock` keeps two Tend commands from changing these files at once.
 - `state.json` holds what Tend records for itself, like conversation history
   and when it last restored. Don't edit it.
 
