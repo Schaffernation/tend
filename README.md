@@ -15,6 +15,13 @@ Tend has two parts:
 - `tend`, a command-line tool. It works over ssh.
 - Tend.app, a menu bar app that shows your sessions and runs `tend` for you.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+    <img src="docs/screenshot-light.png" width="402" alt="The Tend panel. It lists six sessions. Three run Claude: recipe-box is busy, api is idle, and notes is waiting for an answer to Claude's trust question, with Trust and Don't trust buttons. A dev server runs in site, docs is stopped, and scratch is a tmux session Tend doesn't track yet.">
+  </picture>
+</p>
+
 ## Who Tend is for
 
 Suppose you run several Claude Code sessions with Remote Control, one per

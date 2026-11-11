@@ -122,6 +122,10 @@ SourceKit reports "'main' attribute cannot be used in a module that contains
 top-level code" for `Tend.swift`. It's a false alarm: `build.sh` compiles with
 `-parse-as-library`.
 
+If you change how the panel looks, run `app/screenshot/make.sh` to update the
+screenshots in the README. It draws the real panel with example sessions, so
+your own sessions don't appear.
+
 ## Write text the same way
 
 Help text, error messages, tooltips, and docs follow the

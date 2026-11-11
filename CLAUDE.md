@@ -45,6 +45,9 @@ what's untested). `CONTRIBUTING.md` covers setup and the pull request process.
   edits to `bin/tend` take effect in the terminal right away.
 - `app/release.sh` builds, signs, notarizes, and packages a disk image.
   `app/make-icon.swift` draws the icon; rerun it after changing the design.
+  `app/screenshot/make.sh` draws the README screenshots from the real panel,
+  with example sessions from `app/screenshot/fake-tend`; rerun it after
+  changing the panel.
 - Use `.help` tooltips for hover text in the app.
 - `skills/tend/SKILL.md` is a Claude Code skill that drives the CLI, usually
   linked from `~/.claude/skills/tend`. When you change a command it uses,
