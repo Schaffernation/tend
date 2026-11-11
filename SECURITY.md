@@ -3,7 +3,7 @@
 ## Report a problem
 
 To report a security problem, use GitHub's
-[private vulnerability reporting](https://github.com/Schaffernation/tend/security/advisories/new).
+[private vulnerability reporting](https://github.com/schaffernation/tend/security/advisories/new).
 Don't open a public issue. Include what you found, how to reproduce it, and
 which version of Tend you used.
 

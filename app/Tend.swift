@@ -3,7 +3,7 @@
 // status, and starts, stops, restarts, and opens them. All the work happens in `tend`; this app only
 // calls it.
 //
-// Source: https://github.com/Schaffernation/tend
+// Source: https://github.com/schaffernation/tend
 // Build and install with app/build.sh. The build copies bin/tend into the
 // app's Resources folder, and the app runs that copy.
 

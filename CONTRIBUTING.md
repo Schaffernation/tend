@@ -32,7 +32,7 @@ Three rules keep the project in shape:
 2. Clone the repository, and link the CLI so your terminal runs your copy:
 
    ```
-   git clone https://github.com/Schaffernation/tend.git
+   git clone https://github.com/schaffernation/tend.git
    cd tend
    ln -sfn "$PWD/bin/tend" ~/.local/bin/tend
    ```

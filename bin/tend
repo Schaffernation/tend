@@ -95,7 +95,7 @@ For a command's flags, run `tend COMMAND --help`.
 
 Config: ~/.config/tend/sessions.json (override with TEND_CONFIG).
 
-Source: https://github.com/Schaffernation/tend
+Source: https://github.com/schaffernation/tend
 """
 
 import sys

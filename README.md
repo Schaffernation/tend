@@ -51,7 +51,7 @@ development server or a script that keeps a connection open.
 ### From a release
 
 1. Download `Tend-VERSION.dmg` from
-   [Releases](https://github.com/Schaffernation/tend/releases), open it, and
+   [Releases](https://github.com/schaffernation/tend/releases), open it, and
    drag Tend to **Applications**.
 2. Open Tend. It appears in the menu bar.
 3. Click the Tend icon, click **Settings**, and turn on **Open Tend at
@@ -65,7 +65,7 @@ development server or a script that keeps a connection open.
 ### From source
 
 ```
-git clone https://github.com/Schaffernation/tend.git
+git clone https://github.com/schaffernation/tend.git
 cd tend
 app/build.sh
 ln -sfn "$PWD/bin/tend" ~/.local/bin/tend
