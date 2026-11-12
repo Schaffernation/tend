@@ -173,6 +173,9 @@ struct Session: Decodable, Identifiable, Hashable {
     let command: String?
     let resume: String?
     let autostart: Bool
+    /// Whether Tend brings back the session's conversation when it restarts.
+    /// When it doesn't, the session starts its plain command every time.
+    let restoreConversation: Bool
     let managed: Bool
     let state: SessionState
     let attached: Bool
@@ -230,11 +233,12 @@ final class Model: ObservableObject {
         var name = ""
         var command = ""
         var autostart = true
+        var restoreConversation = true
         /// "" for no setup, "custom" for setupText as a command, or a recipe ID.
         var setupID = ""
         /// The custom setup command, or the recipe's input, like a URL.
         var setupText = ""
-        /// Whether the form shows Name, Command, Setup, and Restore at login.
+        /// Whether the form shows Name, Command, Setup, and the restore toggles.
         var showOptions = false
     }
 
@@ -467,6 +471,7 @@ final class Model: ObservableObject {
         args += ["--dir", d.dir]
         if !d.name.trimmingCharacters(in: .whitespaces).isEmpty { args += ["--name", d.name] }
         if !d.autostart { args.append("--no-autostart") }
+        if d.appID != nil && !d.restoreConversation { args.append("--no-restore-conversation") }
         let launch = apps.first { $0.id == d.appID }?.launch
         if d.command != launch { args += ["--command", d.command] }
         let text = d.setupText.trimmingCharacters(in: .whitespaces)
@@ -934,6 +939,14 @@ struct NewSessionForm: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .help("Start this session again when Tend restores sessions")
                         }
+                        if draft.appID != nil {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Color.clear.frame(width: NewSessionForm.labelWidth, height: 0)
+                                Toggle("Restore conversation", isOn: binding.restoreConversation)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .help("Bring back the conversation when the session restarts. Turn this off to start the plain command every time, with nothing to recover if a conversation is lost.")
+                            }
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -945,7 +958,7 @@ struct NewSessionForm: View {
                         Label("Options", systemImage: draft.showOptions ? "chevron.down" : "chevron.right")
                     }
                     .buttonStyle(.borderless)
-                    .help("Name, command, setup, and whether to restore at login")
+                    .help("Name, command, setup, and what to restore")
                     Spacer()
                     Button("Cancel") { model.draft = nil }
                     Button("Start") { model.create() }
@@ -1045,7 +1058,9 @@ struct SessionRow: View {
 
     var details: String {
         "Folder: \(shortPath(session.dir))\nCommand: \(session.command ?? "shell")"
-            + (session.resume.map { "\nResumes with: \($0)" } ?? "")
+            + (!session.restoreConversation
+                ? "\nStarts its command every time. Tend doesn't bring back its conversation."
+                : session.resume.map { "\nResumes with: \($0)" } ?? "")
     }
 
     var body: some View {
@@ -1208,6 +1223,11 @@ struct SessionRow: View {
             Button("Start fresh") { confirming = .fresh }
             Button(session.autostart ? "Don't restore at login" : "Restore at login") {
                 model.act(["autostart", session.name, session.autostart ? "off" : "on"])
+            }
+            if session.app != nil || !session.restoreConversation {
+                Button(session.restoreConversation ? "Don't restore conversation" : "Restore conversation") {
+                    model.act(["restore-conversation", session.name, session.restoreConversation ? "off" : "on"])
+                }
             }
         }
         if session.state != .stopped {

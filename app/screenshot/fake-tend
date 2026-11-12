@@ -8,7 +8,7 @@ def claude(status=None, question=None):
             "status": status, "question": question}
 def row(name, d, state, command, app=None, managed=True, autostart=True, named=True, resume=None):
     return {"name": name, "dir": d, "named_after_dir": named, "command": command, "resume": resume,
-            "autostart": autostart, "managed": managed, "state": state, "attached": False, "app": app}
+            "autostart": autostart, "restore_conversation": True, "managed": managed, "state": state, "attached": False, "app": app}
 trust = {"id": "trust", "text": "Trust ~/Projects/notes in Claude Code? Sessions there can read, edit, and run files.",
          "answers": [{"id": "yes", "label": "Trust"}, {"id": "no", "label": "Don't trust"}]}
 out = {

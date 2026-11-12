@@ -49,7 +49,7 @@ it.
 
 - **Session**: a tracked tmux session. Fields: `name`, `dir`, `command` (what
   a fresh start types), `resume` (what a restore types, saved automatically),
-  and `autostart`. Stored in `~/.config/tend/sessions.json`. Earlier versions
+  `autostart`, and `restore_conversation` (stored only when it's off). Stored in `~/.config/tend/sessions.json`. Earlier versions
   called these services and stored them in `services.json`, under a
   `services` key; tend still reads that file and key, and writes back the key
   the file used.
@@ -221,6 +221,29 @@ deliberate, and lives in `sync()`: `status()` itself only reads, so `wait`,
 - **Action errors and refresh errors are separate.** An action's error stays
   until you close it or take another action. Before, the refresh that follows
   every action cleared it right away, so most action errors never showed.
+
+### Sessions that don't restore their conversation
+
+Some sessions only need to be running, not to continue a particular
+conversation. The first example: a `claude rc` session in a folder you start
+other sessions from, so you can always reach the Mac from the Claude app.
+Losing its conversation doesn't matter, and the dropped list shouldn't nag
+about it.
+
+So a session has a `restore_conversation` setting, on by default. With it
+off, `start()` types the session's plain `command`, and `sync()` skips the
+session: no saved `resume`, no history, and no `live` entry, so nothing lands
+on the dropped list. Turning it off also removes the saved `resume`, the
+`live` entry, and the session's dropped conversations. Otherwise the session
+is like any other: it restores at login, stops, and restarts the same way.
+For Claude, a plain `claude rc` still starts in server mode.
+
+We considered making this a special kind of session (a "lead" or "hub" that
+Tend keeps running and restarts when it dies). We chose a setting instead,
+named for what the other sessions do, because the session isn't otherwise
+different. Restarting a session that dies is a separate question for every
+session (see "Is tmux core?"). Pinning sessions to the top of the list is
+planned as its own setting.
 
 ### Dropped conversations
 

@@ -19,6 +19,7 @@ Usage:
                                    ones, the ones next to them, and their
                                    parent folders.
   tend new [APP] [--dir D] [--mkdir] [--name N] [--no-autostart]
+           [--no-restore-conversation]
            [--setup CMD | --recipe ID [--input TEXT]] [-- COMMAND...]
                                    Track and start a new session. Runs the
                                    app's launch command (like `claude rc`), or
@@ -37,14 +38,16 @@ Usage:
                                    connected), is waiting on a question, or
                                    has exited. Exit status: 0 ready, 1 exited,
                                    2 question, 3 timed out.
-  tend add [NAME] [--dir D] [--no-autostart] [--start] [-- COMMAND...]
+  tend add [NAME] [--dir D] [--no-autostart] [--no-restore-conversation]
+           [--start] [-- COMMAND...]
                                    Track a session. With no command, tend
                                    copies the command from the running tmux
                                    session of that name.
   tend snapshot [NAME...]          Track running tmux sessions (default: all).
   tend rm NAME [--stop]            Stop tracking a session.
   tend start NAME [--fresh]        Start a tracked session. Resumes its app,
-                                   like Claude, unless --fresh.
+                                   like Claude, unless --fresh or the session
+                                   doesn't restore conversations.
   tend stop NAME                   Close the session's tmux session.
   tend restart NAME [--fresh]      Stop, then start. Works from inside the
                                    session it restarts.
@@ -70,6 +73,12 @@ Usage:
                                    nothing if tend already restored since the
                                    Mac started.
   tend autostart NAME on|off       Turn restore on or off for a session.
+  tend restore-conversation NAME on|off
+                                   Choose whether tend brings back a session's
+                                   conversation (on by default). When it's
+                                   off, tend starts the session's plain
+                                   command, and doesn't record its
+                                   conversations or list them as dropped.
   tend accounts [add|rm USER] [--json]
                                    Watch other accounts on this Mac, and
                                    warn when one isn't logged in or isn't
@@ -489,12 +498,24 @@ def dismiss(name=None, conversation=None):
     return len(dropped) - len(keep)
 
 
+def dismiss_session(name):
+    """Take every conversation from one session off the dropped list."""
+    with edit_state() as state:
+        state["dropped"] = [d for d in state.get("dropped", []) if dropped_entry(d)["session"] != name]
+
+
 # ---------------------------------------------------------------- lookups
 
 
 def find(cfg, name):
     """The tracked session named `name`, or None."""
     return next((s for s in cfg[SESSIONS_KEY] if s["name"] == name), None)
+
+
+def restores_conversation(session):
+    """Whether tend brings back this session's conversation. When it doesn't,
+    tend starts the plain command and doesn't record conversations."""
+    return session.get("restore_conversation", True)
 
 
 def need(cfg, name):
@@ -1046,6 +1067,7 @@ def status(cfg):
                 command=session.get("command"),
                 resume=session.get("resume"),
                 autostart=session.get("autostart", True),
+                restore_conversation=restores_conversation(session),
                 managed=True,
                 state=info["state"],
                 attached=info["attached"],
@@ -1064,6 +1086,7 @@ def status(cfg):
                 command=detected_command(info),
                 resume=info["app"] and info["app"]["resume"],
                 autostart=False,
+                restore_conversation=True,
                 managed=False,
                 state=info["state"],
                 attached=info["attached"],
@@ -1079,9 +1102,10 @@ def sync(cfg, rows):
     command that reconnects it), the conversations it has run, and which
     conversations a restart dropped.
 
-    Updates `cfg` and `rows` to match what it saved.
+    Skips sessions that don't restore conversations. Updates `cfg` and `rows`
+    to match what it saved.
     """
-    running = [r for r in rows if r["managed"] and r["app"]]
+    running = [r for r in rows if r["managed"] and r["app"] and r["restore_conversation"]]
     updates = {
         r["name"]: r["app"]["resume"]
         for r in running
@@ -1171,7 +1195,8 @@ def unique_name(cfg, name):
 
 def start(cfg, session, fresh=False, command=None):
     """Start a tracked session. Uses command if given; otherwise the saved
-    resume command, or with fresh, the saved command."""
+    resume command, or with fresh or for a session that doesn't restore
+    conversations, the saved command."""
     name = session["name"]
     if has_session(name):
         return f"'{name}' is already running."
@@ -1179,7 +1204,8 @@ def start(cfg, session, fresh=False, command=None):
         raise TendError(f"{session['dir']} isn't a folder. If it moved, track it again with `tend add`.")
     ensure_server(cfg)
     if not command:
-        command = session.get("command") if fresh else (session.get("resume") or session.get("command"))
+        plain = fresh or not restores_conversation(session)
+        command = session.get("command") if plain else (session.get("resume") or session.get("command"))
     tmux("new-session", "-d", "-s", name, "-c", session["dir"])
     if command:
         type_command(name, command)
@@ -1614,6 +1640,8 @@ def cmd_new(cfg, opts):
             "command": command,
             "autostart": not opts.no_autostart,
         }
+        if opts.no_restore_conversation:
+            session["restore_conversation"] = False
         fresh[SESSIONS_KEY].append(session)
     print(start(cfg, session))
     note = app and app.get("preflight") and preflight(app["preflight"], folder, session["name"])
@@ -1630,6 +1658,9 @@ def cmd_add(cfg, opts):
             raise TendError(f"'{name}' is already tracked. Remove it first with `tend rm {name}`.")
         if rows is not None:
             session = adopt(fresh, name, rows)
+            if opts.no_restore_conversation:
+                session["restore_conversation"] = False
+                session.pop("resume", None)
         else:
             session = {
                 "name": name,
@@ -1637,6 +1668,8 @@ def cmd_add(cfg, opts):
                 "command": shlex.join(opts.after_dashes) if opts.after_dashes else None,
                 "autostart": not opts.no_autostart,
             }
+            if opts.no_restore_conversation:
+                session["restore_conversation"] = False
             fresh[SESSIONS_KEY].append(session)
     print(f"Tracking '{name}'.")
     if opts.start:
@@ -1792,6 +1825,25 @@ def cmd_autostart(cfg, opts):
     with edit_config() as fresh:
         need(fresh, opts.name)["autostart"] = opts.value == "on"
     print(f"Autostart for '{opts.name}' is {opts.value}.")
+
+
+def cmd_restore_conversation(cfg, opts):
+    on = opts.value == "on"
+    with edit_config() as fresh:
+        session = need(fresh, opts.name)
+        if on:
+            session.pop("restore_conversation", None)
+        else:
+            session["restore_conversation"] = False
+            # The saved resume command and the dropped list are about the
+            # conversation, so they go too.
+            session.pop("resume", None)
+    if not on:
+        forget_live(opts.name)
+        dismiss_session(opts.name)
+        print(f"'{opts.name}' starts its plain command, and tend doesn't bring back its conversations.")
+    else:
+        print(f"tend brings back the conversation in '{opts.name}' when it restarts.")
 
 
 def cmd_apps(cfg, opts):
@@ -1972,6 +2024,9 @@ def cmd_config(cfg, opts):
         print(f"State:  {paths['state']}")
 
 
+NO_RESTORE_HELP = "start the plain command every time, and don't record or bring back conversations"
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="tend", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1988,6 +2043,7 @@ def build_parser():
     sp.add_argument("name", nargs="?")
     sp.add_argument("--dir", default=os.getcwd())
     sp.add_argument("--no-autostart", action="store_true")
+    sp.add_argument("--no-restore-conversation", action="store_true", help=NO_RESTORE_HELP)
     sp.add_argument("--start", action="store_true")
 
     sp = command("new", cmd_new, help="track and start a new session")
@@ -1995,6 +2051,7 @@ def build_parser():
     sp.add_argument("--dir", default=os.getcwd())
     sp.add_argument("--name")
     sp.add_argument("--no-autostart", action="store_true")
+    sp.add_argument("--no-restore-conversation", action="store_true", help=NO_RESTORE_HELP)
     sp.add_argument("--command", help="a shell command, typed into the session as is")
     sp.add_argument("--mkdir", action="store_true", help="create the folder if it doesn't exist")
     sp.add_argument("--setup", help="a shell command to run in the folder once, before the app starts")
@@ -2082,6 +2139,14 @@ def build_parser():
     sp.add_argument("--json", action="store_true")
 
     sp = command("autostart", cmd_autostart, help="turn restore on or off for a session")
+    sp.add_argument("name")
+    sp.add_argument("value", choices=["on", "off"])
+
+    sp = command(
+        "restore-conversation",
+        cmd_restore_conversation,
+        help="choose whether tend brings back a session's conversation when it restarts",
+    )
     sp.add_argument("name")
     sp.add_argument("value", choices=["on", "off"])
 

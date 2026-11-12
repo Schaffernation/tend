@@ -216,6 +216,54 @@ class TestHistory(TendTestCase):
         self.assertEqual(self.tend.dismiss(None, None), 1)
 
 
+class TestRestoreConversation(TendTestCase):
+    """A session with restore_conversation off starts its plain command, and
+    tend doesn't record its conversations."""
+
+    def row(self, name, restore):
+        chat = {"id": f"{name}-chat", "label": None, "recover": "claude --resume x --remote-control"}
+        app = {"resume": "claude --resume abc", "conversations": [chat], "pid": 123}
+        return {"name": name, "dir": "/p", "managed": True, "resume": None, "app": app,
+                "restore_conversation": restore}
+
+    def test_sync_skips_sessions_that_dont_restore(self):
+        with self.tend.edit_config() as cfg:
+            cfg["sessions"] += [{"name": "on", "dir": "/p"}, {"name": "off", "dir": "/p", "restore_conversation": False}]
+        cfg = self.tend.load()
+        self.tend.sync(cfg, [self.row("on", True), self.row("off", False)])
+        saved = {s["name"]: s for s in self.tend.load()["sessions"]}
+        self.assertEqual(saved["on"]["resume"], "claude --resume abc")
+        self.assertNotIn("resume", saved["off"])
+        state = self.tend.load_state()
+        self.assertEqual(set(state["history"]), {"on"})
+        self.assertEqual(set(state["live"]), {"on"})
+
+    def test_start_uses_the_plain_command(self):
+        typed = []
+        with mock.patch.multiple(self.tend, has_session=lambda n: False, ensure_server=lambda c: None,
+                                 tmux=lambda *a, **k: None, type_command=lambda n, c: typed.append(c)):
+            base = {"name": "s", "dir": "/", "command": "claude rc", "resume": "claude --resume abc"}
+            self.tend.start({}, base)
+            self.tend.start({}, {**base, "restore_conversation": False})
+        self.assertEqual(typed, ["claude --resume abc", "claude rc"])
+
+    def test_turning_it_off_forgets_the_conversation(self):
+        with self.tend.edit_config() as cfg:
+            cfg["sessions"].append({"name": "s", "dir": "/p", "resume": "claude --resume abc"})
+        self.tend.save_state({"live": {"s": {}}, "dropped": [{"session": "s", "id": "1"}, {"session": "t", "id": "2"}]})
+        with mock.patch("sys.stdout"):
+            self.tend.main(["restore-conversation", "s", "off"])
+        session = self.tend.load()["sessions"][0]
+        self.assertIs(session["restore_conversation"], False)
+        self.assertNotIn("resume", session)
+        state = self.tend.load_state()
+        self.assertEqual(state["live"], {})
+        self.assertEqual(state["dropped"], [{"session": "t", "id": "2"}])
+        with mock.patch("sys.stdout"):
+            self.tend.main(["restore-conversation", "s", "on"])
+        self.assertNotIn("restore_conversation", self.tend.load()["sessions"][0])
+
+
 class TestConfigFiles(TendTestCase):
     def test_missing_config_gives_defaults(self):
         self.assertEqual(self.tend.load()["sessions"], [])
@@ -349,6 +397,13 @@ class TestEndToEnd(unittest.TestCase):
         rows = self.rows()
         self.assertNotEqual(rows["a"]["state"], "stopped")
         self.assertEqual(rows["b"]["state"], "stopped")
+
+    def test_no_restore_conversation_flag(self):
+        self.tend("add", "plain", "--dir", str(self.dir), "--no-restore-conversation", "--", "sleep", "600")
+        self.tend("new", "--name", "other", "--dir", str(self.dir), "--", "sleep", "600")
+        rows = self.rows()
+        self.assertIs(rows["plain"]["restore_conversation"], False)
+        self.assertIs(rows["other"]["restore_conversation"], True)
 
     def test_answer_types_into_a_waiting_app(self):
         fake = self.dir / "bin" / "claude"

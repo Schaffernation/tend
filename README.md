@@ -127,6 +127,11 @@ When a session runs Claude Code, Tend does the following:
   `tend answer NAME yes`.
 - **Starts fresh when you ask.** To start a new conversation instead of
   reconnecting, run `tend restart NAME --fresh`.
+- **Skips the conversation when you don't need it.** For a session you only
+  need to be running, like a Remote Control session you start other sessions
+  from, turn off **Restore conversation**: right-click the session, or run
+  `tend restore-conversation NAME off`. Tend then starts its plain command
+  every time, and doesn't record its conversations or list them as dropped.
 
 Tend reads files that Claude Code writes for its own use:
 `~/.claude/sessions/*.json`, the trusted folders in `~/.claude.json`, and the

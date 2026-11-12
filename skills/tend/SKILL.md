@@ -14,7 +14,7 @@ flag, run `tend --help`.
 Route by the request. With arguments, the first word picks the branch: `new`
 starts a session, `help` shows the menu, and any other `tend` command (`ls`,
 `open`, `stop`, `restart`, `start`, `history`, `resume`, `dropped`, `recover`, `snapshot`,
-`autostart`, `rm`) runs under
+`autostart`, `restore-conversation`, `rm`) runs under
 **Manage sessions**. With no arguments and no request, or when the user asks
 what this can do, show the menu.
 
@@ -105,6 +105,11 @@ Show this, then ask what they'd like to do:
   starts a tracked session that's stopped.
 - `tend snapshot [NAME]` tracks running tmux sessions, so tend restores them.
 - `tend autostart NAME on|off` sets whether a restart brings it back.
+- `tend restore-conversation NAME on|off` sets whether tend brings back its
+  conversation. With it off, tend starts the plain command every time, and
+  doesn't record its conversations or list them as dropped. Use it for a
+  session that only needs to be running, like one the user starts other
+  sessions from. `tend new` and `tend add` take `--no-restore-conversation`.
 
 Stopping or restarting a session ends the program running in it, and for
 Claude, that's a conversation that may be mid-task. Before `tend stop`,
