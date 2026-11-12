@@ -559,14 +559,6 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @State private var spins = 0.0
 
-    var summary: String {
-        var parts = [model.runningCount == 0 ? "Nothing running" : "\(model.runningCount) running"]
-        let stopped = model.tracked.filter { $0.state == .stopped }.count
-        if stopped > 0 { parts.append("\(stopped) stopped") }
-        if model.waitingCount > 0 { parts.append("\(model.waitingCount) waiting for you") }
-        return parts.joined(separator: " · ")
-    }
-
     /// The Restore button's tooltip, which names the sessions it starts.
     var restoreHelp: String {
         let names = model.restorable.map(\.name).joined(separator: ", ")
@@ -609,6 +601,13 @@ struct ContentView: View {
                 }
             }
 
+            if let watched = model.accounts?.watched, !watched.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    SectionHeader("Other accounts") { EmptyView() }
+                    ForEach(watched) { AccountRow(account: $0) }
+                }
+            }
+
             Divider()
             footer
         }
@@ -618,10 +617,7 @@ struct ContentView: View {
 
     var header: some View {
         HStack(spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("Tend").font(.headline)
-                Text(summary).font(.callout).foregroundStyle(.secondary).lineLimit(1)
-            }
+            Text("Tend").font(.headline)
             Spacer()
             if model.busy { ProgressView().controlSize(.small) }
             Button {
@@ -784,6 +780,30 @@ struct DroppedBanner: View {
 }
 
 /// A small heading over a group of rows, with room for a button.
+/// A quiet line for a watched account in the panel: whether it's logged in,
+/// and a light that's green while its Tend runs. Problems also show as
+/// banners at the top of the panel.
+struct AccountRow: View {
+    let account: AccountStatus
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(account.name)
+            Text(account.loggedIn ? "logged in" : "not logged in")
+            Spacer()
+            if account.loggedIn {
+                Circle().fill(account.tendRunning ? Color.green : Color.orange).frame(width: 6, height: 6)
+                Text(account.tendRunning ? "Tend running" : "Tend not running")
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .help(account.problem ?? "\(account.name) is logged in and their Tend is running, so their sessions restart if they stop.")
+    }
+}
+
 struct SectionHeader<Trailing: View>: View {
     let title: String
     let trailing: Trailing
