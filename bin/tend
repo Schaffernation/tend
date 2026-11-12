@@ -1553,7 +1553,7 @@ def print_table(rows):
     if not rows:
         print("No sessions and no tmux sessions. Start one with `tend new`, or track one with `tend add`.")
         return
-    table = [("NAME", "STATE", "APP", "AUTO", "DIR", "COMMAND")]
+    table = [("NAME", "STATE", "APP", "AUTO", "CHAT", "DIR", "COMMAND")]
     for r in rows:
         info = r["app"]
         table.append(
@@ -1562,14 +1562,15 @@ def print_table(rows):
                 r["state"] + (" (attached)" if r["attached"] else ""),
                 f"{info['name']} {info['status'] or ''}".strip() if info else "-",
                 ("yes" if r["autostart"] else "no") if r["managed"] else "-",
+                ("restore" if r["restore_conversation"] else "fresh") if r["managed"] else "-",
                 short_path(r["dir"]),
                 r["command"] or "(shell)",
             )
         )
     # Pad every column but the last, so long commands don't widen the table.
-    widths = [max(len(line[i]) for line in table) for i in range(5)]
+    widths = [max(len(line[i]) for line in table) for i in range(6)]
     for line in table:
-        print("  ".join(v.ljust(w) for v, w in zip(line[:5], widths)) + "  " + line[5])
+        print("  ".join(v.ljust(w) for v, w in zip(line[:6], widths)) + "  " + line[6])
     if any(not r["managed"] for r in rows):
         print("\n* not tracked. Run `tend snapshot` to track every running session.")
     for r in rows:

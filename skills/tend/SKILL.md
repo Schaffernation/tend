@@ -96,8 +96,11 @@ Show this, then ask what they'd like to do:
 ## Manage sessions
 
 - `tend ls` lists tracked sessions and untracked tmux sessions (marked `*`),
-  with each one's state and, for Claude, whether it's `busy` or `idle`. Use
-  `tend ls --json` when you need fields.
+  with each one's state and, for Claude, whether it's `busy` or `idle`. Its
+  AUTO column says whether the session restores at login, and its CHAT
+  column says whether tend brings back its conversation (`restore`) or
+  starts its plain command every time (`fresh`). Use `tend ls --json` when
+  you need fields (`autostart`, `restore_conversation`).
 - When `tend ls` says a session is waiting on a question (like Claude's
   trust prompt), ask the user, then run `tend answer NAME ANSWER`, and
   `tend wait NAME` to confirm it carried on.

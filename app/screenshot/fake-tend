@@ -6,17 +6,17 @@ p = lambda name: f"{home}/Projects/{name}"
 def claude(status=None, question=None):
     return {"id": "claude", "name": "Claude", "icon": "com.anthropic.claudefordesktop",
             "status": status, "question": question}
-def row(name, d, state, command, app=None, managed=True, autostart=True, named=True, resume=None):
+def row(name, d, state, command, app=None, managed=True, autostart=True, named=True, resume=None, restore=True):
     return {"name": name, "dir": d, "named_after_dir": named, "command": command, "resume": resume,
-            "autostart": autostart, "restore_conversation": True, "managed": managed, "state": state, "attached": False, "app": app}
+            "autostart": autostart, "restore_conversation": restore, "managed": managed, "state": state, "attached": False, "app": app}
 trust = {"id": "trust", "text": "Trust ~/Projects/notes in Claude Code? Sessions there can read, edit, and run files.",
          "answers": [{"id": "yes", "label": "Trust"}, {"id": "no", "label": "Don't trust"}]}
 out = {
     "ls": [
         row("recipe-box", p("recipe-box"), "running", "claude rc", claude("busy"), resume="claude rc"),
-        row("api", p("api"), "running", "claude rc", claude("idle"), resume="claude rc"),
+        row("api", p("api"), "running", "claude rc", claude("idle"), resume="claude rc", restore=False),
         row("notes", p("notes"), "running", "claude rc", claude(None, trust)),
-        row("site", p("site"), "running", "npm run dev"),
+        row("site", p("site"), "running", "npm run dev", autostart=False),
         row("docs", p("docs"), "stopped", "claude rc", resume="claude rc"),
         row("scratch", home, "running", None, managed=False, autostart=False, named=False),
     ],

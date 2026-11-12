@@ -809,6 +809,79 @@ struct AccountRow: View {
     }
 }
 
+/// The Restore conversation icon: a speech bubble, slashed when the setting is
+/// off. It's drawn at 90% and one weight heavier, so it matches the
+/// `autostartstop` icon beside it in size and stroke.
+struct ConversationIcon: View {
+    let off: Bool
+
+    var body: some View {
+        Group {
+            if off {
+                SlashedSymbol(name: "bubble.left", strokeScale: 1 / 0.9)
+            } else {
+                Image(systemName: "bubble.left")
+            }
+        }
+        .fontWeight(.medium)
+        .scaleEffect(0.9)
+    }
+}
+
+/// An SF Symbol with a slash drawn like Apple's `.slash` variants, for
+/// symbols that have none, like `bubble.left`. The geometry was measured from
+/// `flag.slash`, `bell.slash`, and `autostartstop.slash`: a round-capped
+/// stroke at 45 degrees, 0.072 of the point size wide, with a gap of 0.07 cut
+/// on each side. It starts a little above the symbol's top edge and runs
+/// into the bottom-right corner.
+struct SlashedSymbol: View {
+    let name: String
+    /// Multiplies the slash's stroke width, to match a symbol drawn heavier.
+    var strokeScale: CGFloat = 1
+
+    /// The point size the symbol was drawn at, from its rendered height.
+    static func pointSize(of name: String, height: CGFloat) -> CGFloat {
+        let probe: CGFloat = 100
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: probe, weight: .regular)),
+              image.size.height > 0 else { return height }
+        return height / (image.size.height / probe)
+    }
+
+    /// The slash's center line, stroke width, and gap, for a symbol of this size.
+    func slash(_ size: CGSize) -> (line: Path, stroke: CGFloat, gap: CGFloat) {
+        let pt = SlashedSymbol.pointSize(of: name, height: size.height)
+        let half = pt * 0.6 / 2.squareRoot()
+        let extra = pt * 0.1 / 2.squareRoot()
+        let center = CGPoint(x: size.width / 2, y: size.height / 2 - pt * 0.13)
+        let line = Path { p in
+            p.move(to: CGPoint(x: center.x - half, y: center.y - half))
+            p.addLine(to: CGPoint(x: center.x + half + extra, y: center.y + half + extra))
+        }
+        return (line, pt * 0.072 * strokeScale, pt * 0.07)
+    }
+
+    var body: some View {
+        Image(systemName: name)
+            .mask {
+                Canvas { context, size in
+                    let s = slash(size)
+                    context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.black))
+                    context.blendMode = .destinationOut
+                    context.stroke(s.line, with: .color(.black),
+                                   style: StrokeStyle(lineWidth: s.stroke + 2 * s.gap, lineCap: .round))
+                }
+            }
+            .overlay {
+                GeometryReader { g in
+                    let s = slash(g.size)
+                    s.line.stroke(style: StrokeStyle(lineWidth: s.stroke, lineCap: .round))
+                }
+            }
+            .accessibilityLabel("\(name), off")
+    }
+}
+
 struct SectionHeader<Trailing: View>: View {
     let title: String
     let trailing: Trailing
@@ -935,14 +1008,14 @@ struct NewSessionForm: View {
                         }
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Color.clear.frame(width: NewSessionForm.labelWidth, height: 0)
-                            Toggle("Restore at login", isOn: binding.autostart)
+                            Toggle(isOn: binding.autostart) { Label("Restore at login", systemImage: "autostartstop") }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .help("Start this session again when Tend restores sessions")
                         }
                         if draft.appID != nil {
                             HStack(alignment: .firstTextBaseline, spacing: 8) {
                                 Color.clear.frame(width: NewSessionForm.labelWidth, height: 0)
-                                Toggle("Restore conversation", isOn: binding.restoreConversation)
+                                Toggle(isOn: binding.restoreConversation) { Label("Restore conversation", systemImage: "bubble.left") }
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .help("Bring back the conversation when the session restarts. Turn this off to start the plain command every time, with nothing to recover if a conversation is lost.")
                             }
@@ -1070,12 +1143,7 @@ struct SessionRow: View {
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 4) {
                         Text(session.name).fontWeight(.medium).lineLimit(1)
-                        if session.managed && !session.autostart {
-                            Image(systemName: "autostartstop.slash")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .help("Tend doesn't start \(session.name) when it restores sessions. Right-click the row to change that.")
-                        }
+                        settingIcons
                     }
                     Text(folder).font(.caption).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.head)
@@ -1238,6 +1306,35 @@ struct SessionRow: View {
             Button("Stop tracking") { model.act(["rm", session.name]) }
         } else {
             Button("Track") { model.act(["snapshot", session.name]) }
+        }
+    }
+
+    /// Whether the session can resume, so Restore conversation means something.
+    var canResume: Bool { session.app != nil || session.resume != nil || !session.restoreConversation }
+
+    /// An icon for each restore setting. A setting that's off always shows,
+    /// slashed. Settings that are on show, lighter, while you hover.
+    @ViewBuilder var settingIcons: some View {
+        if session.managed {
+            let show = hovering || alwaysShowButtons
+            HStack(spacing: 3) {
+                if !session.autostart {
+                    Image(systemName: "autostartstop.slash")
+                        .help("Tend doesn't start \(session.name) when it restores sessions. Right-click the row to change that.")
+                } else if show {
+                    Image(systemName: "autostartstop").foregroundStyle(.tertiary)
+                        .help("Tend starts \(session.name) when it restores sessions, like after the Mac restarts.")
+                }
+                if !session.restoreConversation {
+                    ConversationIcon(off: true)
+                        .help("\(session.name) starts its command every time. Tend doesn't bring back its conversation or list it as dropped. Right-click the row to change that.")
+                } else if show && canResume {
+                    ConversationIcon(off: false).foregroundStyle(.tertiary)
+                        .help("Tend brings back \(session.name)'s conversation when it restarts.")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 

@@ -209,6 +209,15 @@ deliberate, and lives in `sync()`: `status()` itself only reads, so `wait`,
 - **Rows keep their order.** Moving sessions that need attention to the top
   made rows jump around. Instead, a question shows as a card under its row, and
   errors and account problems show as banners at the top of the panel.
+- **Each restore setting has an icon next to the name.** Restore at login is
+  `autostartstop`, and Restore conversation is a speech bubble. A setting
+  that's off always shows its icon, slashed. Settings that are on, the usual
+  case, show lighter while you hover, so you can check any row. SF Symbols has
+  no slashed bubble, so `SlashedSymbol` draws Apple's slash, measured from
+  `flag.slash`, `bell.slash`, and `autostartstop.slash`, extended a little
+  into the bottom-right corner. `ConversationIcon` draws the bubble at 90%
+  and one weight heavier, so it matches `autostartstop` in size and stroke. The new-session form labels its toggles with the same
+  symbols.
 - **Orange means "needs you."** Questions and account problems use it.
   Nothing else does: an exited session's badge is yellow.
 - **Restart asks first, inline.** Restart and Start fresh turn the row's
